@@ -106,6 +106,15 @@ class Repo:
         with sqlite3.connect(self.path) as cx:
             cx.row_factory = sqlite3.Row
             return cx.execute("SELECT * FROM devices WHERE id=?", (device_id,)).fetchone()
+        # NUEVO: buscar dispositivo por número de serie (para eventos que llegan en JSON)
+    def find_device_by_serial(self, serial: str):
+        with sqlite3.connect(self.path) as cx:
+            cx.row_factory = sqlite3.Row
+            return cx.execute(
+                "SELECT * FROM devices WHERE serial=?",
+                (serial,)
+            ).fetchone()
+
     def list_devices(self, user_id: int, q: str = '', page: int = 1, page_size: int = 10) -> Tuple[List[sqlite3.Row], int]:
         with sqlite3.connect(self.path) as cx:
             cx.row_factory = sqlite3.Row
@@ -448,93 +457,244 @@ class HistogramTab(ttk.Frame):
         self.canvas = FigureCanvasTkAgg(fig, master=self); self.canvas.draw(); self.canvas.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=8)
 
 class WiFiPicoBridge:
-    def __init__(self, host="0.0.0.0", port=12345):
-        self.host=host; self.port=port
-        self._srv=None; self._thr=None
-        self._pico=None; self._lock=threading.Lock()
+    def __init__(self, host="0.0.0.0", port=12345, repo: Optional[Repo] = None):
+        self.host = host
+        self.port = port
+        self.repo = repo             # <- acceso directo al Repo para guardar eventos
+        self._srv = None
+        self._thr = None
+        self._pico = None
+        self._lock = threading.Lock()
         self._start_server()
+
     def _start_server(self):
         def loop():
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            srv.bind((self.host, self.port)); srv.listen(5)
+            srv.bind((self.host, self.port))
+            srv.listen(5)
             self._srv = srv
             while True:
-                c,a = srv.accept()
+                c, a = srv.accept()
                 c.settimeout(10)
                 try:
                     first = c.recv(64)
                 except Exception:
-                    try: c.close()
-                    except Exception: pass
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
                     continue
+
+                # Conexión de control de la Pico (cerradura / servo)
                 if b"PICO_READY" in first:
                     with self._lock:
                         if self._pico:
-                            try: self._pico.close()
-                            except Exception: pass
+                            try:
+                                self._pico.close()
+                            except Exception:
+                                pass
                         self._pico = c
                 else:
-                    t = threading.Thread(target=self._handle_client, args=(c, first), daemon=True)
+                    # Cualquier otro cliente: lo manejamos en un hilo aparte
+                    t = threading.Thread(
+                        target=self._handle_client,
+                        args=(c, first),
+                        daemon=True
+                    )
                     t.start()
-        self._thr = threading.Thread(target=loop, daemon=True); self._thr.start()
+
+        self._thr = threading.Thread(target=loop, daemon=True)
+        self._thr.start()
+
     def _handle_client(self, sock, prefeed: bytes):
+        """Maneja conexiones "normales": JSON de eventos o comandos de texto."""
         try:
-            buf = prefeed if prefeed else b""
+            buf = prefeed or b""
             while True:
-                data = sock.recv(1024)
-                if not data: break
+                try:
+                    data = sock.recv(1024)
+                except socket.timeout:
+                    # Si no llega nada un rato, cerramos
+                    break
+                except Exception:
+                    break
+
+                if not data:
+                    break
                 buf += data
+
+                # Procesar línea por línea (\n o \r)
                 while b"\n" in buf or b"\r" in buf:
                     if b"\n" in buf:
                         idx = buf.index(b"\n")
                     else:
                         idx = buf.index(b"\r")
-                    line = buf[:idx].decode("utf-8","ignore").strip()
-                    buf = buf[idx+1:]
+
+                    line_bytes = buf[:idx]
+                    buf = buf[idx + 1:]
+
+                    line = line_bytes.decode("utf-8", "ignore").strip()
+                    if not line:
+                        continue
+
+                    # 1) Intentar tratarlo como JSON de evento
+                    if self._try_handle_json_event(line):
+                        # Puedes mandar un ACK simple si quieres
+                        try:
+                            sock.sendall(b"OK\n")
+                        except Exception:
+                            pass
+                        continue
+
+                    # 2) Si no es JSON válido de evento, lo tratamos como comando de texto
                     resp = self.send_line(line)
-                    try: sock.sendall((resp+"\n").encode("utf-8"))
-                    except Exception: pass
+                    try:
+                        sock.sendall((resp + "\n").encode("utf-8"))
+                    except Exception:
+                        pass
         finally:
-            try: sock.close()
-            except Exception: pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _try_handle_json_event(self, line: str) -> bool:
+        """
+        Intenta interpretar la línea como un JSON de evento de dispositivo.
+        Devuelve True si se procesó como evento (aunque el dispositivo no exista),
+        False si no era un JSON de evento y hay que tratarlo como comando normal.
+        """
+        if not self.repo:
+            return False
+
+        try:
+            obj = json.loads(line)
+        except Exception:
+            return False
+
+        if not isinstance(obj, dict):
+            return False
+
+        # Opcional: campo "kind": "event" para dejar claro que es un evento
+        kind = obj.get("kind") or obj.get("type_kind") or ""
+        if kind and kind not in ("event", "hw_event"):
+            # Si trae "kind" pero no es de tipo evento, no lo tocamos
+            return False
+
+        # Número de serie del dispositivo (debe coincidir con devices.serial en la BD)
+        serial = obj.get("serial") or obj.get("device_serial")
+        if not serial:
+            return False
+
+        row = self.repo.find_device_by_serial(serial)
+        if not row:
+            # El JSON es válido, pero el dispositivo no existe en la app
+            print(f"[WiFiPicoBridge] Evento para serie desconocida: {serial}")
+            return True  # lo consideramos manejado para no enviar error al cliente
+
+        
+        if not bool(row["armed"]):
+            print(f"[WiFiPicoBridge] Evento ignorado (dispositivo DESARMADO): {serial}")
+            return True  # No guardamos nada en la bitácora
+
+        user_id = row["user_id"]
+        device_id = row["id"]
+
+        # Campos de evento
+        event_type = obj.get("event_type") or obj.get("type") or "generic"
+        severity = obj.get("severity") or "low"
+        message = (
+            obj.get("message")
+            or obj.get("msg")
+            or f"Evento {event_type} desde dispositivo {serial}"
+        )
+
+
+        extra = obj.get("extra") or {}
+        if not isinstance(extra, dict):
+            extra = {"value": extra}
+        # Marcamos fuente como hardware / WiFi
+        extra.setdefault("source", "wifi")
+
+        # Guardar en la bitácora (tabla events)
+        self.repo.add_event(
+            user_id=user_id,
+            device_id=device_id,
+            type_=event_type,
+            severity=severity,
+            message=message,
+            image_path=None,
+            extra=extra,
+        )
+
+        print(f"[WiFiPicoBridge] Evento registrado: {event_type} ({severity}) serial={serial}")
+        return True
+
     def _readline(self, s, timeout_ms=1500):
-        s.settimeout(0.05); buf=b""; t0=time.time()
-        while (time.time()-t0)*1000 < timeout_ms:
-            try: ch = s.recv(1)
-            except socket.timeout: continue
-            except Exception: break
-            if not ch: break
+        """Lectura bloqueante de una línea de la Pico (para respuestas a comandos)."""
+        s.settimeout(0.05)
+        buf = b""
+        t0 = time.time()
+        while (time.time() - t0) * 1000 < timeout_ms:
+            try:
+                ch = s.recv(1)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+            if not ch:
+                break
             buf += ch
-            if buf.endswith(b"\n") or buf.endswith(b"\r"): break
-        return buf.decode("utf-8","ignore").strip()
+            if buf.endswith(b"\n") or buf.endswith(b"\r"):
+                break
+        return buf.decode("utf-8", "ignore").strip()
+
     def send_line(self, line: str) -> str:
+        """
+        Comandos hacia la Pico (cerradura / servo).
+        Mantiene el comportamiento original: ping, open, close, servo...
+        """
         cmd = line.strip().lower()
-        if cmd == "ping": cmd_out = "PING"
-        elif cmd == "open": cmd_out = "LOCK OPEN"
-        elif cmd == "close": cmd_out = "LOCK CLOSE"
+        if cmd == "ping":
+            cmd_out = "PING"
+        elif cmd == "open":
+            cmd_out = "LOCK OPEN"
+        elif cmd == "close":
+            cmd_out = "LOCK CLOSE"
         elif cmd.startswith("servo"):
             parts = cmd.split()
-            if len(parts)==2:
+            if len(parts) == 2:
                 try:
-                    ang = int(float(parts[1])); ang = max(0,min(180,ang)); cmd_out = f"SERVO {ang}"
-                except: return "ERR BAD ANGLE"
-            else: return "ERR BAD ANGLE"
-        else: cmd_out = line.strip()
+                    ang = int(float(parts[1]))
+                    ang = max(0, min(180, ang))
+                    cmd_out = f"SERVO {ang}"
+                except Exception:
+                    return "ERR BAD ANGLE"
+            else:
+                return "ERR BAD ANGLE"
+        else:
+            cmd_out = line.strip()
+
         with self._lock:
-            if not self._pico: return "ERR NO_PICO"
+            if not self._pico:
+                return "ERR NO_PICO"
             try:
-                self._pico.sendall((cmd_out+"\n").encode("utf-8"))
+                self._pico.sendall((cmd_out + "\n").encode("utf-8"))
                 resp = self._readline(self._pico, timeout_ms=2000)
                 return resp if resp else "ERR NO_RESP"
             except Exception:
-                try: self._pico.close()
-                except Exception: pass
-                self._pico=None
+                try:
+                    self._pico.close()
+                except Exception:
+                    pass
+                self._pico = None
                 return "ERR SEND"
+
     def is_connected(self) -> bool:
         with self._lock:
             return self._pico is not None
+
 
 class UsbPicoLink:
     def __init__(self, port="COM6", baud=115200):
@@ -732,7 +892,7 @@ class App(tk.Tk):
         try: self.style.theme_use('clam')
         except Exception: pass
         self.repo = repo
-        self.wifi = WiFiPicoBridge(host="0.0.0.0", port=12345)
+        self.wifi = WiFiPicoBridge(host="0.0.0.0", port=12345, repo=self.repo)
         usb = UsbPicoLink(port="COM6").open()
         self.pico = PicoUnified(self.wifi, usb)
         self._show_login()
