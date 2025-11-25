@@ -303,6 +303,30 @@ class DevicesTab(ttk.Frame):
         if not did: return
         ScheduleDialog(self, self.repo, device_id=did, on_saved=lambda: self.banner.show("Horarios actualizados", 'success'))
 
+class MotionSensorTab(ttk.Frame):
+    def __init__(self, master, repo, user, banner):
+        super().__init__(master)
+
+        self.repo = repo
+        self.user = user
+        self.banner = banner
+
+        ttk.Label(self, text="Eventos del sensor PIR", font=("Segoe UI", 14)).pack(pady=10)
+
+        self.listbox = tk.Listbox(self, font=("Segoe UI", 11))
+        self.listbox.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.update_events()
+
+    def update_events(self):
+        self.listbox.delete(0, "end")
+        rows, total = self.repo.list_events(self.user.id, typ="motion_start", severity="", page=1, page_size=50)
+
+        for r in rows:
+            self.listbox.insert("end", f"{r['ts']} — {r['message']}")
+
+        self.after(2000, self.update_events)
+
 class DeviceAddDialog(tk.Toplevel):
     def __init__(self, master, repo: Repo, user: User, on_saved=None):
         super().__init__(master); self.title("Registrar dispositivo por número de serie"); self.repo=repo; self.user=user; self.on_saved=on_saved; self.resizable(False, False); self.grab_set()
@@ -1029,7 +1053,7 @@ class MainView(ttk.Frame):
         self.tab_events  = EventsTab(nb, self.repo, self.user, self.banner)
         self.tab_hist    = HistogramTab(nb, self.repo, self.user, self.banner)
         self.tab_lock    = LockTab(nb, self.repo, self.user, self.banner, pico=self.pico)
-        self.tab_motion  = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Detector de movimiento", title="Panel específico — Detector de movimiento")
+        self.tab_motion = MotionSensorTab(nb, self.repo, self.user, self.banner)
         self.tab_smoke   = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Sensor de humo", title="Panel específico — Sensor de humo")
         self.tab_camera  = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Cámara con foto por movimiento", title="Panel específico — Cámara con foto por movimiento")
         self.tab_presence = PresenceSimTab(nb, self.repo, self.user, self.banner, pico=self.pico)
