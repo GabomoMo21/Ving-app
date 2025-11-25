@@ -739,6 +739,13 @@ class PicoUnified:
     def lock_close(self)->bool: return "OK LOCK CLOSE" in self._send("LOCK CLOSE")
     def servo(self, ang:int)->bool: return "OK SERVO" in self._send(f"SERVO {ang}")
 
+    def send_line(self, line: str) -> str:
+        """
+        Enviar un comando arbitrario a la Pico.
+        Mantiene la lógica unificada: primero WiFi, luego USB (COM).
+        """
+        return self._send(line)
+
 class LockTab(ttk.Frame):
     def __init__(self, master, repo: Repo, user: User, banner: Banner, pico:PicoUnified):
         super().__init__(master); self.repo=repo; self.user=user; self.banner=banner; self.pico=pico
@@ -807,6 +814,170 @@ class DeviceTypeTab(ttk.Frame):
         self.repo.add_event(self.user.id, did, 'generic', 'low', f"Evento simulado para tipo {self.device_type}", None, {})
         self.banner.show(f"Evento simulado ({self.device_type})", 'info'); play_beep(900, 120)
 
+class PresenceSimTab(ttk.Frame):
+    """
+    Pestaña de simulador de presencia.
+    Replica la interfaz de SimuladorGUI pero integrada en VING
+    y usando PicoUnified (WiFi/USB) en lugar de abrir su propio Serial.
+    """
+    def __init__(self, master, repo: Repo, user: User, banner: Banner, pico: PicoUnified):
+        super().__init__(master)
+        self.repo = repo
+        self.user = user
+        self.banner = banner
+        self.pico = pico
+
+        # ---- Construcción de la interfaz ----
+        self._crear_widgets()
+
+    # -------------------------------------------------
+    # Construye todos los widgets de la interfaz
+    # -------------------------------------------------
+    def _crear_widgets(self):
+        # Título
+        info = ttk.Frame(self, padding=10)
+        info.pack(fill="x")
+        ttk.Label(
+            info,
+            text="Simulador de presencia (horarios y control manual)",
+            font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w")
+
+        # Hora actual
+        ttk.Label(self, text="Hora actual").pack(pady=(5, 0))
+
+        frame_now = ttk.Frame(self)
+        frame_now.pack(pady=5)
+
+        ttk.Label(frame_now, text="Hora:").grid(row=0, column=0, padx=2)
+        self.entryHourNow = ttk.Entry(frame_now, width=3)
+        self.entryHourNow.grid(row=0, column=1, padx=2)
+
+        ttk.Label(frame_now, text="Minuto:").grid(row=0, column=2, padx=2)
+        self.entryMinuteNow = ttk.Entry(frame_now, width=3)
+        self.entryMinuteNow.grid(row=0, column=3, padx=2)
+
+        # Hora de encendido
+        ttk.Label(self, text="Hora de encendido").pack(pady=(10, 0))
+
+        frame_on = ttk.Frame(self)
+        frame_on.pack(pady=5)
+
+        ttk.Label(frame_on, text="Hora:").grid(row=0, column=0, padx=2)
+        self.entryHourOn = ttk.Entry(frame_on, width=3)
+        self.entryHourOn.grid(row=0, column=1, padx=2)
+
+        ttk.Label(frame_on, text="Minuto:").grid(row=0, column=2, padx=2)
+        self.entryMinuteOn = ttk.Entry(frame_on, width=3)
+        self.entryMinuteOn.grid(row=0, column=3, padx=2)
+
+        # Hora de apagado
+        ttk.Label(self, text="Hora de apagado").pack(pady=(10, 0))
+
+        frame_off = ttk.Frame(self)
+        frame_off.pack(pady=5)
+
+        ttk.Label(frame_off, text="Hora:").grid(row=0, column=0, padx=2)
+        self.entryHourOff = ttk.Entry(frame_off, width=3)
+        self.entryHourOff.grid(row=0, column=1, padx=2)
+
+        ttk.Label(frame_off, text="Minuto:").grid(row=0, column=2, padx=2)
+        self.entryMinuteOff = ttk.Entry(frame_off, width=3)
+        self.entryMinuteOff.grid(row=0, column=3, padx=2)
+
+        # Botones de acción
+        btns = ttk.Frame(self, padding=10)
+        btns.pack()
+
+        ttk.Button(
+            btns,
+            text="Enviar configuración a la Pico",
+            command=self.enviar_config
+        ).grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+
+        ttk.Button(
+            btns,
+            text="Encender LED manualmente",
+            command=self.encender_manual
+        ).grid(row=1, column=0, padx=5, pady=5, sticky="ew")
+
+        ttk.Button(
+            btns,
+            text="Apagar LED manualmente",
+            command=self.apagar_manual
+        ).grid(row=2, column=0, padx=5, pady=5, sticky="ew")
+
+        # Label de estado
+        self.label_status = ttk.Label(self, text="", foreground="blue", padding=10)
+        self.label_status.pack(anchor="w")
+
+        # Para que la pestaña tenga refresco compatible con MainView._refresh_type_tabs
+        # (aunque aquí no hacemos nada especial).
+        # Esto evita errores cuando MainView llama tab.refresh_state().
+    def refresh_state(self):
+        pass
+
+    # -------------------------------------------------
+    # Función auxiliar para enviar datos a la Pico
+    # -------------------------------------------------
+    def _enviar_a_pico(self, line: str, msg_ok: str, msg_error_prefix: str):
+        if not self.pico:
+            self.label_status.config(text="No hay enlace configurado con la Pico.")
+            return
+
+        resp = self.pico.send_line(line)
+        # Consideramos error solo los problemas claros de enlace
+        if resp.startswith("ERR NO_PICO") or resp.startswith("ERR SEND"):
+            self.label_status.config(text=f"{msg_error_prefix}: {resp}")
+        else:
+            # Puede devolver algo como 'OK ...' o incluso 'ERR NO_RESP'
+            # pero el comando ya se envió por el canal unificado (WiFi/USB).
+            self.label_status.config(text=f"{msg_ok} (resp: {resp})")
+
+    # -------------------------------------------------
+    # Enviar configuración de horarios (modo automático)
+    # Formato: hora_now;min_now;hora_on;min_on;hora_off;min_off
+    # -------------------------------------------------
+    def enviar_config(self):
+        try:
+            hour_now    = int(self.entryHourNow.get())
+            minute_now  = int(self.entryMinuteNow.get())
+            hour_on     = int(self.entryHourOn.get())
+            minute_on   = int(self.entryMinuteOn.get())
+            hour_off    = int(self.entryHourOff.get())
+            minute_off  = int(self.entryMinuteOff.get())
+        except ValueError:
+            self.label_status.config(text="Error: todos los campos deben ser números enteros")
+            return
+
+        linea = f"{hour_now};{minute_now};{hour_on};{minute_on};{hour_off};{minute_off}"
+        self._enviar_a_pico(
+            linea,
+            "Configuración enviada a la Pico.",
+            "Error al enviar configuración"
+        )
+
+    # -------------------------------------------------
+    # Encender LED en modo manual
+    # -------------------------------------------------
+    def encender_manual(self):
+        self._enviar_a_pico(
+            "ON",
+            "Comando ON enviado a la Pico.",
+            "Error ON"
+        )
+
+    # -------------------------------------------------
+    # Apagar LED en modo manual
+    # -------------------------------------------------
+    def apagar_manual(self):
+        self._enviar_a_pico(
+            "OFF",
+            "Comando OFF enviado a la Pico.",
+            "Error OFF"
+        )
+
+
 class QuickActions(ttk.Frame):
     def __init__(self, master, repo: Repo, user: User, banner: Banner):
         super().__init__(master); self.repo=repo; self.user=user; self.banner=banner
@@ -861,7 +1032,7 @@ class MainView(ttk.Frame):
         self.tab_motion  = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Detector de movimiento", title="Panel específico — Detector de movimiento")
         self.tab_smoke   = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Sensor de humo", title="Panel específico — Sensor de humo")
         self.tab_camera  = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Cámara con foto por movimiento", title="Panel específico — Cámara con foto por movimiento")
-        self.tab_presence= DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Simulador de presencia", title="Panel específico — Simulador de presencia")
+        self.tab_presence = PresenceSimTab(nb, self.repo, self.user, self.banner, pico=self.pico)
         self.tab_panic   = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Botón de pánico", title="Panel específico — Botón de pánico")
         self.tab_doorwin = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Puertas/ventanas", title="Panel específico — Puertas/ventanas")
         self.tab_silent  = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Alarma silenciosa", title="Panel específico — Alarma silenciosa")
