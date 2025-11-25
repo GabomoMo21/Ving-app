@@ -721,7 +721,7 @@ class WiFiPicoBridge:
 
 
 class UsbPicoLink:
-    def __init__(self, port="COM6", baud=115200):
+    def __init__(self, port="COM5", baud=115200):
         self.port=port; self.baud=baud; self.ser=None
     def open(self):
         try:
@@ -812,23 +812,77 @@ class LockTab(ttk.Frame):
         self.banner.show("Cerradura cerrada (90°)", 'success'); self.state_lbl.config(text="Estado: cerrada (90°)"); play_beep(740, 140)
 
 class DeviceTypeTab(ttk.Frame):
-    def __init__(self, master, repo: Repo, user: User, banner: Banner, device_type: str, title: str):
-        super().__init__(master); self.repo=repo; self.user=user; self.banner=banner; self.device_type=device_type
-        info = ttk.Frame(self, padding=10); info.pack(fill='x')
+    def __init__(
+        self,
+        master,
+        repo: Repo,
+        user: User,
+        banner: Banner,
+        device_type: str,
+        title: str,
+        require_device: bool = True   # ← NUEVO
+    ):
+        super().__init__(master)
+        self.repo = repo
+        self.user = user
+        self.banner = banner
+        self.device_type = device_type
+        self.require_device = require_device  # ← NUEVO
+
+        info = ttk.Frame(self, padding=10)
+        info.pack(fill='x')
         ttk.Label(info, text=title, font=("Segoe UI", 10, "bold")).pack(anchor='w')
-        self.msg_lbl = ttk.Label(self, text="", padding=10); self.msg_lbl.pack(anchor='w')
-        self.btn_frame = ttk.Frame(self, padding=10); self.btn_frame.pack(fill='x')
-        self.btn_action = ttk.Button(self.btn_frame, text="Simular evento", command=self._simulate); self.btn_action.pack(side='left', padx=4, pady=4)
+
+        self.msg_lbl = ttk.Label(self, text="", padding=10)
+        self.msg_lbl.pack(anchor='w')
+
+        self.btn_frame = ttk.Frame(self, padding=10)
+        self.btn_frame.pack(fill='x')
+
+        self.btn_action = ttk.Button(
+            self.btn_frame,
+            text="Simular evento",
+            command=self._simulate
+        )
+        self.btn_action.pack(side='left', padx=4, pady=4)
+
         self.refresh_state()
     def _device_count(self) -> int: return self.repo.count_devices_by_type(self.user.id, self.device_type)
     def refresh_state(self):
         cnt = self._device_count()
-        if cnt <= 0:
-            self.msg_lbl.configure(text="Necesitas añadir un dispositivo de este tipo", foreground='gray')
-            for c in self.btn_frame.winfo_children(): c.configure(state='disabled')
+
+        # Caso normal: sí requiere dispositivo registrado
+        if self.require_device:
+            if cnt <= 0:
+                self.msg_lbl.configure(
+                    text="Necesitas añadir un dispositivo de este tipo",
+                    foreground='gray'
+                )
+                for c in self.btn_frame.winfo_children():
+                    c.configure(state='disabled')
+            else:
+                self.msg_lbl.configure(
+                    text=f"Hay {cnt} dispositivo(s) de tipo {self.device_type}.",
+                    foreground='black'
+                )
+                for c in self.btn_frame.winfo_children():
+                    c.configure(state='normal')
+        # Caso especial: NO requiere dispositivo (pánico)
         else:
-            self.msg_lbl.configure(text=f"Hay {cnt} dispositivo(s) de tipo {self.device_type}.", foreground='black')
-            for c in self.btn_frame.winfo_children(): c.configure(state='normal')
+            if cnt <= 0:
+                # No hay dispositivo, pero el botón igual funciona
+                self.msg_lbl.configure(
+                    text=f"Botón activo (sin dispositivo registrado)",
+                    foreground='black'
+                )
+            else:
+                self.msg_lbl.configure(
+                    text=f"Hay {cnt} dispositivo(s) de tipo {self.device_type}.",
+                    foreground='black'
+                )
+            # Siempre habilitado
+            for c in self.btn_frame.winfo_children():
+                c.configure(state='normal')
     def _simulate(self):
         did = None
         with sqlite3.connect(self.repo.path) as cx:
@@ -1057,7 +1111,69 @@ class MainView(ttk.Frame):
         self.tab_smoke   = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Sensor de humo", title="Panel específico — Sensor de humo")
         self.tab_camera  = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Cámara con foto por movimiento", title="Panel específico — Cámara con foto por movimiento")
         self.tab_presence = PresenceSimTab(nb, self.repo, self.user, self.banner, pico=self.pico)
-        self.tab_panic   = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Botón de pánico", title="Panel específico — Botón de pánico")
+        self.tab_panic   = DeviceTypeTab(
+            nb,
+            self.repo,
+            self.user,
+            self.banner,
+            device_type="Botón de pánico",
+            title="Panel específico — Botón de pánico",
+            require_device=False         # ← clave
+        )
+        self.tab_panic.btn_action.config(text="ACTIVAR PÁNICO")
+        for c in self.tab_panic.btn_frame.winfo_children():
+            c.pack_forget()  # quitamos el pack anterior ("side='left'")
+
+        self.tab_panic.btn_action.pack(pady=20)  # lo volvemos a agregar centrado
+
+        # Estilo rojo con borde marcado
+        style = ttk.Style()
+        style.configure(
+            "Panic.TButton",
+            foreground="white",
+            background="#cc0000",
+            borderwidth=4,
+            relief="raised"
+        )
+        style.map(
+            "Panic.TButton",
+            background=[("active", "#ff0000")],
+            relief=[("pressed", "sunken"), ("!pressed", "raised")]
+        )
+        def panic_sim():
+            # Buscar (opcionalmente) un dispositivo de tipo "Botón de pánico"
+            did = None
+            with sqlite3.connect(self.repo.path) as cx:
+                cx.row_factory = sqlite3.Row
+                r = cx.execute(
+                    "SELECT id FROM devices WHERE user_id=? AND type=? ORDER BY id LIMIT 1",
+                    (self.user.id, "Botón de pánico")
+                ).fetchone()
+                if r:
+                    did = r["id"]
+
+            # Registrar SIEMPRE un evento de pánico, aunque did sea None
+            self.repo.add_event(
+                self.user.id,
+                did,
+                type_="panic",
+                severity="critical",
+                message="Botón de pánico activado (panel específico)",
+                image_path=None,
+                extra={"source": "desktop_panic_tab"}
+            )
+
+            # Mostrar notificación visual y sonora
+            self.banner.show("Botón de pánico ACTIVADO", "priority")
+            play_beep(1600, 400)
+
+            # Refrescar la bitácora para verlo de una vez
+            self.tab_events.refresh()
+
+        # Reemplazar el comando del botón genérico por el de pánico
+        self.tab_panic.btn_action.configure(command=panic_sim)
+
+        self.tab_panic.btn_action.configure(style="Panic.TButton")
         self.tab_doorwin = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Puertas/ventanas", title="Panel específico — Puertas/ventanas")
         self.tab_silent  = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Alarma silenciosa", title="Panel específico — Alarma silenciosa")
         self.tab_laser   = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Barrera láser", title="Panel específico — Barrera láser")
@@ -1088,7 +1204,7 @@ class App(tk.Tk):
         except Exception: pass
         self.repo = repo
         self.wifi = WiFiPicoBridge(host="0.0.0.0", port=12345, repo=self.repo)
-        usb = UsbPicoLink(port="COM6").open()
+        usb = UsbPicoLink(port="COM5").open()
         self.pico = PicoUnified(self.wifi, usb)
         self._show_login()
     def _show_login(self):
