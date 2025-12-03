@@ -28,6 +28,34 @@ try:
 except Exception:
     HAS_MPL = False
 
+# Soporte para OpenCV (cámara de la PC)
+HAS_CV2 = True
+try:
+    import cv2
+except Exception:
+    HAS_CV2 = False
+
+HAS_PYTESS = True
+try:
+    import pytesseract
+    from pytesseract import TesseractNotFoundError
+
+    # Intentar configurar automáticamente la ruta de tesseract en Windows
+    if os.name == "nt":
+        posibles_rutas = [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        ]
+        for ruta in posibles_rutas:
+            if os.path.exists(ruta):
+                pytesseract.pytesseract.tesseract_cmd = ruta
+                break
+except Exception:
+    HAS_PYTESS = False
+
+import re
+
+
 DB_PATH = os.path.join(os.path.dirname(__file__), 'ving.db')
 
 SCHEMA_SQL = r"""
@@ -39,6 +67,16 @@ CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id 
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
 CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,ts TEXT NOT NULL,channel TEXT NOT NULL,priority TEXT NOT NULL,title TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL,FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS plates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    plate TEXT NOT NULL,
+    alias TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+    UNIQUE(user_id, plate)
+);
+
 """
 
 def hash_password(pw: str) -> str:
@@ -150,6 +188,55 @@ class Repo:
     def add_notification(self, user_id: int, channel: str, priority: str, title: str, body: str, status: str):
         with sqlite3.connect(self.path) as cx:
             cx.execute("INSERT INTO notifications (user_id, ts, channel, priority, title, body, status) VALUES (?,?,?,?,?,?,?)",(user_id, utcnow_str(), channel, priority, title, body, status))
+        # --------- Placas autorizadas (LPR) ---------
+
+    def add_plate(self, user_id: int, plate: str, alias: str = "") -> int:
+        plate = plate.strip().upper()
+        if not plate:
+            raise ValueError("La placa no puede estar vacía")
+
+        with sqlite3.connect(self.path) as cx:
+            cx.row_factory = sqlite3.Row
+            try:
+                cur = cx.execute(
+                    "INSERT INTO plates (user_id, plate, alias, created_at) "
+                    "VALUES (?,?,?,?)",
+                    (user_id, plate, alias, utcnow_str()
+                                )
+                                )
+                return cur.lastrowid
+            except sqlite3.IntegrityError:
+                raise ValueError("Esa placa ya está registrada")
+
+    def list_plates(self, user_id: int):
+        with sqlite3.connect(self.path) as cx:
+            cx.row_factory = sqlite3.Row
+            cur = cx.execute(
+                "SELECT * FROM plates WHERE user_id=? ORDER BY plate",
+                (user_id,)
+            )
+            return list(cur.fetchall())
+
+    def delete_plate(self, user_id: int, plate: str):
+        plate = plate.strip().upper()
+        with sqlite3.connect(self.path) as cx:
+            cx.execute(
+                "DELETE FROM plates WHERE user_id=? AND plate=?",
+                (user_id, plate)
+            )
+
+    def find_plate(self, user_id: int, plate: str):
+        plate = plate.strip().upper()
+        with sqlite3.connect(self.path) as cx:
+            cx.row_factory = sqlite3.Row
+            return cx.execute(
+                "SELECT * FROM plates WHERE user_id=? AND plate=?",
+                (user_id, plate)
+            ).fetchone()
+
+    def is_plate_authorized(self, user_id: int, plate: str) -> bool:
+        return self.find_plate(user_id, plate) is not None
+
 
 @dataclass
 class User:
@@ -292,12 +379,32 @@ class DevicesTab(ttk.Frame):
         DeviceEditDialog(self, self.repo, device_id=did, on_saved=lambda: (self.banner.show("Dispositivo actualizado", 'success'), self.refresh()))
     def _toggle_arm(self):
         did = self._selected_id()
-        if not did: return
-        row = self.repo.get_device(did); newv = not bool(row['armed'])
-        self.repo.set_device_armed(did, newv); state = 'Armado' if newv else 'Desarmado'
+        if not did:
+            return
+
+        row = self.repo.get_device(did)
+        newv = not bool(row['armed'])
+
+        self.repo.set_device_armed(did, newv)
+        state = 'Armado' if newv else 'Desarmado'
+
         self.banner.show(f"{row['alias']}: {state}", 'info')
-        self.repo.add_event(self.user.id, did, type_='arm_state', severity='low', message=f"Sistema {state.lower()}", image_path=None, extra={})
+        self.repo.add_event(
+            self.user.id,
+            did,
+            type_='arm_state',
+            severity='low',
+            message=f"Sistema {state.lower()}",
+            image_path=None,
+            extra={}
+        )
+
         self.refresh()
+
+        # 🔔 Avisar al MainView para que actualice las pestañas de tipo
+        if self.on_event:
+            self.on_event('devices_changed')
+
     def _open_sched(self):
         did = self._selected_id()
         if not did: return
@@ -326,6 +433,10 @@ class MotionSensorTab(ttk.Frame):
             self.listbox.insert("end", f"{r['ts']} — {r['message']}")
 
         self.after(2000, self.update_events)
+
+    def refresh_state(self):
+        pass
+
 
 class DeviceAddDialog(tk.Toplevel):
     def __init__(self, master, repo: Repo, user: User, on_saved=None):
@@ -721,7 +832,7 @@ class WiFiPicoBridge:
 
 
 class UsbPicoLink:
-    def __init__(self, port="COM5", baud=115200):
+    def __init__(self, port="5", baud=115200):
         self.port=port; self.baud=baud; self.ser=None
     def open(self):
         try:
@@ -811,6 +922,293 @@ class LockTab(ttk.Frame):
         self.repo.add_event(self.user.id, did, 'lock', 'low', "Cerradura locked [HW]", None, {"by":"desktop"})
         self.banner.show("Cerradura cerrada (90°)", 'success'); self.state_lbl.config(text="Estado: cerrada (90°)"); play_beep(740, 140)
 
+class LprTab(ttk.Frame):
+    """
+    Pestaña específica para reconocimiento de placas (LPR) con cámara de la PC.
+    - Permite registrar placas autorizadas.
+    - Usa la cámara para leer la placa (OCR con Tesseract).
+    - Genera eventos y alertas si la placa NO está registrada.
+    """
+    DEVICE_TYPE = "Reconocimiento de placas"
+
+    def __init__(self, master, repo: Repo, user: User, banner: Banner):
+        super().__init__(master)
+        self.repo = repo
+        self.user = user
+        self.banner = banner
+
+        self._cam_thread = None
+        self._stop_flag = False
+        self._last_detection_time = 0.0
+
+        # ----- Info general -----
+        info = ttk.Frame(self, padding=10)
+        info.pack(fill="x")
+        ttk.Label(
+            info,
+            text="Panel específico — Reconocimiento de placas (cámara PC + OCR)",
+            font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w")
+
+        if not HAS_CV2 or not HAS_PYTESS:
+            msg = "Requiere OpenCV y pytesseract instalados."
+            ttk.Label(info, text=msg, foreground="red").pack(anchor="w")
+
+        # ----- Placas autorizadas -----
+        frm_auth = ttk.LabelFrame(self, text="Placas autorizadas", padding=10)
+        frm_auth.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(frm_auth, text="Placa:").grid(row=0, column=0, padx=4, pady=4, sticky="e")
+        self.e_plate_auth = ttk.Entry(frm_auth, width=12)
+        self.e_plate_auth.grid(row=0, column=1, padx=4, pady=4)
+
+        ttk.Label(frm_auth, text="Alias (opcional):").grid(row=0, column=2, padx=4, pady=4, sticky="e")
+        self.e_alias_auth = ttk.Entry(frm_auth, width=20)
+        self.e_alias_auth.grid(row=0, column=3, padx=4, pady=4)
+
+        ttk.Button(
+            frm_auth,
+            text="Agregar placa autorizada",
+            command=self._add_plate
+        ).grid(row=0, column=4, padx=6, pady=4)
+
+        self.list_auth = tk.Listbox(frm_auth, height=6)
+        self.list_auth.grid(row=1, column=0, columnspan=4, sticky="nsew", padx=4, pady=4)
+
+        ttk.Button(
+            frm_auth,
+            text="Eliminar seleccionada",
+            command=self._del_plate
+        ).grid(row=1, column=4, padx=6, pady=4, sticky="n")
+
+        frm_auth.columnconfigure(3, weight=1)
+        frm_auth.rowconfigure(1, weight=1)
+
+        # ----- Cámara LPR -----
+        frm_cam = ttk.LabelFrame(self, text="Cámara LPR (PC)", padding=10)
+        frm_cam.pack(fill="x", padx=10, pady=5)
+
+        self.lbl_devices = ttk.Label(frm_cam, text="")
+        self.lbl_devices.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+
+        self.btn_start = ttk.Button(
+            frm_cam,
+            text="Iniciar cámara LPR",
+            command=self._start_camera
+        )
+        self.btn_start.grid(row=1, column=0, padx=4, pady=4)
+
+        self.btn_stop = ttk.Button(
+            frm_cam,
+            text="Detener cámara LPR",
+            command=self._stop_camera,
+            state="disabled"
+        )
+        self.btn_stop.grid(row=1, column=1, padx=4, pady=4)
+
+        self.lbl_result = ttk.Label(frm_cam, text="No hay lecturas todavía.", padding=8)
+        self.lbl_result.grid(row=2, column=0, columnspan=3, sticky="w")
+
+        # Cargar datos iniciales
+        self._reload_auth()
+        self.refresh_state()
+
+    # ---------- Gestión de placas autorizadas ----------
+
+    def _reload_auth(self):
+        self.list_auth.delete(0, "end")
+        rows = self.repo.list_plates(self.user.id)
+        for r in rows:
+            alias = r["alias"] or ""
+            txt = r["plate"] if not alias else f"{r['plate']} — {alias}"
+            self.list_auth.insert("end", txt)
+
+    def _add_plate(self):
+        plate = self.e_plate_auth.get().strip().upper()
+        alias = self.e_alias_auth.get().strip()
+        if not plate:
+            self.banner.show("Ingresa una placa para registrar", "warning")
+            return
+        try:
+            self.repo.add_plate(self.user.id, plate, alias)
+        except ValueError as ex:
+            self.banner.show(str(ex), "danger")
+            return
+        self.e_plate_auth.delete(0, "end")
+        self.e_alias_auth.delete(0, "end")
+        self._reload_auth()
+        self.banner.show(f"Placa {plate} registrada como autorizada", "success")
+
+    def _del_plate(self):
+        sel = self.list_auth.curselection()
+        if not sel:
+            return
+        txt = self.list_auth.get(sel[0])
+        plate = txt.split("—")[0].strip().upper()
+        self.repo.delete_plate(self.user.id, plate)
+        self._reload_auth()
+        self.banner.show(f"Placa {plate} eliminada de autorizadas", "info")
+
+    # ---------- Utilidades de dispositivos ----------
+
+    def _device_count(self) -> int:
+        return self.repo.count_devices_by_type(self.user.id, self.DEVICE_TYPE)
+
+    def _pick_device(self) -> Optional[int]:
+        with sqlite3.connect(self.repo.path) as cx:
+            cx.row_factory = sqlite3.Row
+            r = cx.execute(
+                "SELECT id FROM devices WHERE user_id=? AND type=? ORDER BY id LIMIT 1",
+                (self.user.id, self.DEVICE_TYPE)
+            ).fetchone()
+            return r["id"] if r else None
+
+    # ---------- API llamada desde MainView ----------
+
+    def refresh_state(self):
+        cnt = self._device_count()
+        if cnt <= 0:
+            self.lbl_devices.configure(
+                text="No hay dispositivo de tipo 'Reconocimiento de placas'. "
+                     "Registra uno en la pestaña Dispositivos.",
+                foreground="gray"
+            )
+        else:
+            self.lbl_devices.configure(
+                text=f"Hay {cnt} dispositivo(s) de tipo '{self.DEVICE_TYPE}'.",
+                foreground="black"
+            )
+
+    # ---------- Cámara LPR ----------
+
+    def _start_camera(self):
+        if not HAS_CV2 or not HAS_PYTESS:
+            self.banner.show("Falta OpenCV o pytesseract para usar la cámara LPR", "danger")
+            return
+        if self._cam_thread and self._cam_thread.is_alive():
+            return
+        self._stop_flag = False
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        t = threading.Thread(target=self._camera_loop, daemon=True)
+        self._cam_thread = t
+        t.start()
+        self.banner.show("Cámara LPR iniciada (ventana de OpenCV).", "info")
+
+    def _stop_camera(self):
+        self._stop_flag = True
+        self.btn_start.configure(state="normal")
+        self.btn_stop.configure(state="disabled")
+        self.banner.show("Cámara LPR detenida.", "info")
+
+    def _camera_loop(self):
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            self._update_result("No se pudo abrir la cámara de la PC.")
+            self._stop_camera()
+            return
+
+        COOLDOWN = 5.0  # segundos entre detecciones
+        regex_plate = re.compile(r"[A-Z0-9]{5,8}")
+
+        while not self._stop_flag:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Mostrar la imagen en una ventana aparte
+            cv2.imshow("LPR - Cámara PC", frame)
+            if cv2.waitKey(30) & 0xFF == 27:  # ESC para cerrar manualmente
+                self._stop_flag = True
+                break
+
+            # Región central donde esperamos la placa (simulación)
+            h, w, _ = frame.shape
+            y1, y2 = int(h * 0.4), int(h * 0.7)
+            x1, x2 = int(w * 0.2), int(w * 0.8)
+            roi = frame[y1:y2, x1:x2]
+
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            _, thresh = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY)
+
+            # ----- OCR con manejo de errores -----
+            try:
+                text_raw = pytesseract.image_to_string(
+                    thresh,
+                    config="--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+                )
+            except TesseractNotFoundError:
+                # Error típico: tesseract no instalado o no en PATH
+                self._update_result("Error: Tesseract no está instalado o no está en el PATH.")
+                self.banner.show("Error de Tesseract: verifica la instalación y la ruta.", "danger")
+                self._stop_flag = True
+                break
+            except Exception as e:
+                # Cualquier otro error de OCR: lo mostramos pero no crasheamos
+                self._update_result(f"Error de OCR: {e}")
+                # Continuamos con el siguiente frame
+                continue
+
+            text_raw = text_raw.strip().upper().replace(" ", "")
+
+            match = regex_plate.search(text_raw)
+            if match:
+                plate = match.group(0)
+                now = time.time()
+                if now - self._last_detection_time > COOLDOWN:
+                    self._handle_plate_detected(plate)
+                    self._last_detection_time = now
+
+        cap.release()
+        # Destruir la ventana de forma segura (puede no existir)
+        try:
+            cv2.destroyWindow("LPR - Cámara PC")
+        except Exception:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+
+    def _update_result(self, text: str):
+        self.after(0, lambda: self.lbl_result.configure(text=text))
+
+    def _handle_plate_detected(self, plate: str):
+        autorizado = self.repo.is_plate_authorized(self.user.id, plate)
+        did = self._pick_device()
+
+        msg = (
+            f"Placa {plate} autorizada"
+            if autorizado
+            else f"Placa {plate} NO autorizada"
+        )
+        severity = "low" if autorizado else "high"
+
+        self.repo.add_event(
+            self.user.id,
+            did,
+            type_="lpr",
+            severity=severity,
+            message=msg,
+            image_path=None,
+            extra={"plate": plate, "authorized": autorizado, "source": "desktop_lpr_cam"}
+        )
+
+        if not autorizado:
+            self.repo.add_notification(
+                self.user.id,
+                channel="inapp",
+                priority="alta",
+                title="LPR",
+                body=f"Vehículo NO registrado ({plate})",
+                status="sent"
+            )
+            self.banner.show(msg, "priority")
+        else:
+            self.banner.show(msg, "info")
+
+        self._update_result(msg)
+
+
 class DeviceTypeTab(ttk.Frame):
     def __init__(
         self,
@@ -891,6 +1289,215 @@ class DeviceTypeTab(ttk.Frame):
             if r: did = r['id']
         self.repo.add_event(self.user.id, did, 'generic', 'low', f"Evento simulado para tipo {self.device_type}", None, {})
         self.banner.show(f"Evento simulado ({self.device_type})", 'info'); play_beep(900, 120)
+
+class CameraTab(ttk.Frame):
+    """
+    Pestaña específica para 'Cámara con foto por movimiento'.
+    - Solo se activa si hay al menos una cámara registrada y ARMADA.
+    - Usa la cámara de la PC (cv2.VideoCapture(0)).
+    - Cuando detecta movimiento, guarda foto y registra evento en la bitácora.
+    """
+    DEVICE_TYPE = "Cámara con foto por movimiento"
+
+    def __init__(self, master, repo: Repo, user: User, banner: Banner):
+        super().__init__(master)
+        self.repo = repo
+        self.user = user
+        self.banner = banner
+
+        self._cam_thread = None
+        self._stop_flag = False
+
+        info = ttk.Frame(self, padding=10)
+        info.pack(fill="x")
+        ttk.Label(
+            info,
+            text="Panel específico — Cámara con foto por movimiento",
+            font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w")
+
+        self.lbl_status = ttk.Label(self, text="", padding=10)
+        self.lbl_status.pack(anchor="w")
+
+        if not HAS_CV2:
+            self._set_status(
+                "OpenCV no está disponible. Instala con: "
+                "python -m pip install opencv-python"
+            )
+        else:
+            self._set_status(
+                "Esperando que registres una cámara y la marques como Armado."
+            )
+
+        # Para que MainView pueda llamarlo en _refresh_type_tabs
+        self.refresh_state()
+
+    # ---------- utilidades internas ----------
+
+    def _set_status(self, text: str):
+        # Aseguramos modificar el label desde el hilo de Tkinter
+        self.after(0, lambda: self.lbl_status.config(text=text))
+
+    def _has_armed_camera(self) -> bool:
+        """¿Hay al menos una cámara de este tipo armada para este usuario?"""
+        with sqlite3.connect(self.repo.path) as cx:
+            cx.row_factory = sqlite3.Row
+            r = cx.execute(
+                "SELECT 1 FROM devices "
+                "WHERE user_id=? AND type=? AND armed=1 "
+                "LIMIT 1",
+                (self.user.id, self.DEVICE_TYPE)
+            ).fetchone()
+            return bool(r)
+
+    def _get_first_armed_camera_id(self) -> Optional[int]:
+        with sqlite3.connect(self.repo.path) as cx:
+            cx.row_factory = sqlite3.Row
+            r = cx.execute(
+                "SELECT id FROM devices "
+                "WHERE user_id=? AND type=? AND armed=1 "
+                "ORDER BY id LIMIT 1",
+                (self.user.id, self.DEVICE_TYPE)
+            ).fetchone()
+            return r["id"] if r else None
+
+    # ---------- API llamada desde MainView ----------
+
+    def refresh_state(self):
+        """
+        Llamado cuando cambian los dispositivos (armado/desarmado).
+        Arranca o detiene el hilo de la cámara según corresponda.
+        """
+        if not HAS_CV2:
+            # Si no hay OpenCV, no hacemos nada más
+            return
+
+        if self._has_armed_camera():
+            self._start_watcher()
+            self._set_status(
+                "Cámara armada: detección de movimiento activa "
+                "(usando la cámara de la PC)."
+            )
+        else:
+            self._stop_watcher()
+            self._set_status(
+                "No hay cámara armada.\n"
+                "Registra un dispositivo de tipo "
+                "'Cámara con foto por movimiento' y márcalo como Armado."
+            )
+
+    # ---------- manejo del hilo de vigilancia ----------
+
+    def _start_watcher(self):
+        if self._cam_thread and self._cam_thread.is_alive():
+            return  # ya está corriendo
+        self._stop_flag = False
+        t = threading.Thread(target=self._camera_loop, daemon=True)
+        self._cam_thread = t
+        t.start()
+
+    def _stop_watcher(self):
+        self._stop_flag = True
+
+    # ---------- bucle principal de la cámara ----------
+
+    def _camera_loop(self):
+        """
+        Bucle de vigilancia:
+        - Abre la cámara de la PC.
+        - Compara frames consecutivos.
+        - Si hay mucho cambio, asume movimiento, guarda foto y registra evento.
+        """
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            self._set_status("No se pudo abrir la cámara de la PC.")
+            return
+
+        ret, frame_prev = cap.read()
+        if not ret:
+            self._set_status("No se pudo leer el primer fotograma de la cámara.")
+            cap.release()
+            return
+
+        frame_prev_gray = cv2.cvtColor(frame_prev, cv2.COLOR_BGR2GRAY)
+        frame_prev_gray = cv2.GaussianBlur(frame_prev_gray, (21, 21), 0)
+
+        MOTION_THRESHOLD = 5000      # píxeles "diferentes" para considerar movimiento
+        COOLDOWN_SECONDS = 3.0       # tiempo mínimo entre fotos
+        last_capture_time = 0.0
+
+        while not self._stop_flag:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (21, 21), 0)
+
+            frame_delta = cv2.absdiff(frame_prev_gray, gray)
+            _, thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)
+            motion_pixels = cv2.countNonZero(thresh)
+
+            if motion_pixels > MOTION_THRESHOLD:
+                now = time.time()
+                if now - last_capture_time > COOLDOWN_SECONDS:
+                    did = self._get_first_armed_camera_id()
+                    if did is None:
+                        # Ya no hay cámara armada, salimos del bucle
+                        self._set_status(
+                            "No hay cámara armada, deteniendo vigilancia."
+                        )
+                        break
+
+                    # Carpeta donde se guardan las fotos
+                    captures_dir = os.path.join(
+                        os.path.dirname(__file__), "capturas_pc_cam"
+                    )
+                    os.makedirs(captures_dir, exist_ok=True)
+
+                    filename = time.strftime("cam_%Y%m%d_%H%M%S.jpg")
+                    full_path = os.path.join(captures_dir, filename)
+
+                    try:
+                        cv2.imwrite(full_path, frame)
+                    except Exception:
+                        # Si falla, no queremos romper el hilo
+                        pass
+
+                    msg = f"Movimiento detectado en cámara. Foto: {filename}"
+
+                    # Registrar en bitácora
+                    self.repo.add_event(
+                        self.user.id,
+                        did,
+                        type_="camera_motion",
+                        severity="high",
+                        message=msg,
+                        image_path=full_path,
+                        extra={"source": "pc_camera"}
+                    )
+
+                    # Notificación en la app
+                    self.repo.add_notification(
+                        self.user.id,
+                        channel="inapp",
+                        priority="alta",
+                        title="Movimiento en cámara",
+                        body=msg,
+                        status="sent"
+                    )
+
+                    # Mostrar algo en la pestaña
+                    self._set_status(f"Última captura: {filename}")
+
+                    last_capture_time = now
+
+            frame_prev_gray = gray
+            time.sleep(0.1)
+
+        cap.release()
+
+
 
 class PresenceSimTab(ttk.Frame):
     """
@@ -1016,6 +1623,47 @@ class PresenceSimTab(ttk.Frame):
     # Enviar configuración de horarios (modo automático)
     # Formato: hora_now;min_now;hora_on;min_on;hora_off;min_off
     # -------------------------------------------------
+    def _registrar_evento_presencia(self, estado: str):
+        """
+        estado: 'encendida' o 'apagada'
+        """
+        did = None
+        # Buscar, si existe, un dispositivo de tipo "Simulador de presencia"
+        with sqlite3.connect(self.repo.path) as cx:
+            cx.row_factory = sqlite3.Row
+            r = cx.execute(
+                "SELECT id FROM devices WHERE user_id=? AND type=? ORDER BY id LIMIT 1",
+                (self.user.id, "Simulador de presencia")
+            ).fetchone()
+            if r:
+                did = r["id"]
+
+        msg = f"Simulador de presencia: luz {estado}"
+
+        # Evento en bitácora
+        self.repo.add_event(
+            self.user.id,
+            did,
+            type_="presence",
+            severity="low",
+            message=msg,
+            image_path=None,
+            extra={"source": "presence_tab", "state": estado}
+        )
+
+        # Notificación (como hace QuickActions._notify)
+        self.repo.add_notification(
+            self.user.id,
+            channel="inapp",
+            priority="normal",
+            title="Presencia",
+            body=msg,
+            status="sent"
+        )
+
+        # Banner en pantalla
+        self.banner.show(msg, "info")
+
     def enviar_config(self):
         try:
             hour_now    = int(self.entryHourNow.get())
@@ -1044,6 +1692,8 @@ class PresenceSimTab(ttk.Frame):
             "Comando ON enviado a la Pico.",
             "Error ON"
         )
+        # NUEVO: registrar evento y notificación
+        self._registrar_evento_presencia("encendida")
 
     # -------------------------------------------------
     # Apagar LED en modo manual
@@ -1054,6 +1704,8 @@ class PresenceSimTab(ttk.Frame):
             "Comando OFF enviado a la Pico.",
             "Error OFF"
         )
+        # NUEVO: registrar evento y notificación
+        self._registrar_evento_presencia("apagada")
 
 
 class QuickActions(ttk.Frame):
@@ -1061,7 +1713,7 @@ class QuickActions(ttk.Frame):
         super().__init__(master); self.repo=repo; self.user=user; self.banner=banner
         ttk.Label(self, text="Simulador de dispositivos (para pruebas)", font=("Segoe UI", 10, 'bold')).pack(anchor='w', padx=8, pady=(8,0))
         grid = ttk.Frame(self); grid.pack(fill='x', padx=8, pady=6)
-        buttons = [("Detector movimiento", self.detect_motion),("Humo detectado", self.smoke_alert),("Cámara: foto por mov.", self.camera_capture),("Simulador presencia", self.presence_tick),("Botón de pánico", self.panic_button),("Puerta/ventana cambio", self.door_window_toggle),("Alarma silenciosa", self.silent_alarm),("Barrera láser", self.laser_barrier),("LPR (placa)", self.lpr_event)]
+        buttons = [("Detector movimiento", self.detect_motion),("Humo detectado", self.smoke_alert),("Cámara: foto por mov.", self.camera_capture),("Simulador presencia", self.presence_tick),("Silenciosa", self.panic_button),("Puerta/ventana cambio", self.door_window_toggle),("Boton de panico", self.silent_alarm),("Barrera láser", self.laser_barrier),("LPR (placa)", self.lpr_event)]
         for i,(txt,cmd) in enumerate(buttons): ttk.Button(grid, text=txt, command=cmd).grid(row=i//2, column=i%2, sticky='ew', padx=4, pady=4)
         for c in range(2): grid.columnconfigure(c, weight=1)
     def _pick_device(self, type_hint: Optional[str]=None) -> Optional[int]:
@@ -1082,7 +1734,7 @@ class QuickActions(ttk.Frame):
     def camera_capture(self):
         did = self._pick_device("Cámara con foto por movimiento"); self.repo.add_event(self.user.id, did, 'camera', 'high', 'Foto capturada por movimiento', None, {}); self._notify('Cámara', 'Imagen adjunta')
     def presence_tick(self): did = self._pick_device("Simulador de presencia"); self.repo.add_event(self.user.id, did, 'presence', 'low', 'Simulador accionó luz', None, {}); self._notify('Presencia', 'Luz conmutada')
-    def panic_button(self): did = self._pick_device("Botón de pánico"); self.repo.add_event(self.user.id, did, 'panic', 'critical', 'Botón de pánico activado', None, {}); self._notify('Pánico', 'Alerta urgente', priority=True); play_beep(1600, 400)
+    def panic_button(self): did = self._pick_device("Silenciosa"); self.repo.add_event(self.user.id, did, 'silent', 'critical', 'Alarma silenciosa', None, {}); self._notify('Silenciosa', 'Alerta urgente', priority=True); play_beep(1600, 400)
     def door_window_toggle(self):
         did = self._pick_device("Puertas/ventanas"); row = self.repo.get_device(did) if did else None; new_state = 'open' if (row and row['status']!='open') else 'closed'
         if did: self.repo.set_device_status(did, new_state)
@@ -1109,18 +1761,18 @@ class MainView(ttk.Frame):
         self.tab_lock    = LockTab(nb, self.repo, self.user, self.banner, pico=self.pico)
         self.tab_motion = MotionSensorTab(nb, self.repo, self.user, self.banner)
         self.tab_smoke   = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Sensor de humo", title="Panel específico — Sensor de humo")
-        self.tab_camera  = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Cámara con foto por movimiento", title="Panel específico — Cámara con foto por movimiento")
+        self.tab_camera  = CameraTab(nb, self.repo, self.user, self.banner)
         self.tab_presence = PresenceSimTab(nb, self.repo, self.user, self.banner, pico=self.pico)
         self.tab_panic   = DeviceTypeTab(
             nb,
             self.repo,
             self.user,
             self.banner,
-            device_type="Botón de pánico",
-            title="Panel específico — Botón de pánico",
+            device_type="Alarma Silenciosa",
+            title="Panel específico — Alarma silenciosa",
             require_device=False         # ← clave
         )
-        self.tab_panic.btn_action.config(text="ACTIVAR PÁNICO")
+        self.tab_panic.btn_action.config(text="Activar Alarma silenciosa")
         for c in self.tab_panic.btn_frame.winfo_children():
             c.pack_forget()  # quitamos el pack anterior ("side='left'")
 
@@ -1156,15 +1808,15 @@ class MainView(ttk.Frame):
             self.repo.add_event(
                 self.user.id,
                 did,
-                type_="panic",
+                type_="Silenciosa",
                 severity="critical",
-                message="Botón de pánico activado (panel específico)",
+                message="Alarma Silenciosa activada",
                 image_path=None,
                 extra={"source": "desktop_panic_tab"}
             )
 
             # Mostrar notificación visual y sonora
-            self.banner.show("Botón de pánico ACTIVADO", "priority")
+            self.banner.show("Alarma Silenciosa activada", "priority")
             play_beep(1600, 400)
 
             # Refrescar la bitácora para verlo de una vez
@@ -1177,11 +1829,11 @@ class MainView(ttk.Frame):
         self.tab_doorwin = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Puertas/ventanas", title="Panel específico — Puertas/ventanas")
         self.tab_silent  = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Alarma silenciosa", title="Panel específico — Alarma silenciosa")
         self.tab_laser   = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Barrera láser", title="Panel específico — Barrera láser")
-        self.tab_lpr     = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Reconocimiento de placas", title="Panel específico — Reconocimiento de placas")
+        self.tab_lpr     = LprTab(nb, self.repo, self.user, self.banner)
         self.tab_quick   = QuickActions(nb, self.repo, self.user, self.banner)
         nb.add(self.tab_devices, text='Dispositivos'); nb.add(self.tab_events,  text='Bitácora'); nb.add(self.tab_hist,    text='Histograma'); nb.add(self.tab_lock,    text='Cerraduras')
         nb.add(self.tab_motion,  text='Movimiento');  nb.add(self.tab_smoke,   text='Humo');     nb.add(self.tab_camera,  text='Cámara');     nb.add(self.tab_presence,text='Presencia')
-        nb.add(self.tab_panic,   text='Pánico');      nb.add(self.tab_doorwin, text='Puertas/Vent.'); nb.add(self.tab_silent,  text='Silenciosa'); nb.add(self.tab_laser,   text='Láser')
+        nb.add(self.tab_panic,   text='Silenciosa');      nb.add(self.tab_doorwin, text='Puertas/Vent.'); nb.add(self.tab_silent,  text='Silenciosa'); nb.add(self.tab_laser,   text='Láser')
         nb.add(self.tab_lpr,     text='Placas');      nb.add(self.tab_quick,   text='Simulador')
         hdr = ttk.Frame(self, padding=6); hdr.pack(fill='x', side='top')
         ttk.Label(hdr, text=f"Bienvenido, {user.name}", font=("Segoe UI", 12, 'bold')).pack(side='left')
@@ -1196,27 +1848,39 @@ class MainView(ttk.Frame):
         self.tab_lock.refresh_state()
         for tab in (self.tab_motion,self.tab_smoke,self.tab_camera,self.tab_presence,self.tab_panic,self.tab_doorwin,self.tab_silent,self.tab_laser,self.tab_lpr):
             tab.refresh_state()
-
 class App(tk.Tk):
     def __init__(self, repo: Repo):
-        super().__init__(); self.geometry('980x720'); self.title('Ving'); self.style = ttk.Style(self)
-        try: self.style.theme_use('clam')
-        except Exception: pass
+        super().__init__()
+        self.geometry('980x720')
+        self.title('Ving')
+        self.style = ttk.Style(self)
+        try:
+            self.style.theme_use('clam')
+        except Exception:
+            pass
         self.repo = repo
         self.wifi = WiFiPicoBridge(host="0.0.0.0", port=12345, repo=self.repo)
-        usb = UsbPicoLink(port="COM5").open()
+        usb = UsbPicoLink(port="COM8").open()
         self.pico = PicoUnified(self.wifi, usb)
         self._show_login()
+
     def _show_login(self):
         for w in self.winfo_children():
-            if isinstance(w, ttk.Notebook) or isinstance(w, ttk.Frame): w.destroy()
+            if isinstance(w, ttk.Notebook) or isinstance(w, ttk.Frame):
+                w.destroy()
         LoginView(self, self.repo, on_login=self._show_main)
+
     def _show_main(self, user: User):
-        for w in self.winfo_children(): w.destroy()
+        for w in self.winfo_children():
+            w.destroy()
         MainView(self, self.repo, user, pico_unified=self.pico)
 
+
 def main():
-    repo = Repo(DB_PATH); app = App(repo); app.mainloop()
+    repo = Repo(DB_PATH)
+    app = App(repo)
+    app.mainloop()
+
 
 if __name__ == '__main__':
     main()
