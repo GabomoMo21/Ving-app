@@ -1,0 +1,49 @@
+{
+  "bot_token": "8571412984:AAGa455XJkBffp1SmsTY2POCzbQMKdsKltU",
+  "telegram_habilitado": true,
+  "telegram_chat_id": 7429143019,
+  "siempre_enviar_criticos": true,
+  "codigo_enlace_pendiente": null,
+  "codigo_enlace_expira": null,
+"dispositivos": {
+  "Detector de movimiento": {
+    "enviar_telegram": true,
+    "severidad_minima": "ALTA"
+  },
+  "Sensor de humo": {
+    "enviar_telegram": true,
+    "severidad_minima": "CRITICA"
+  },
+  "Cámara con foto por movimiento": {
+    "enviar_telegram": true,
+    "severidad_minima": "ALTA"
+  },
+  "Simulador de presencia": {
+    "enviar_telegram": false,
+    "severidad_minima": "ALTA"
+  },
+  "Puertas/ventanas": {
+    "enviar_telegram": true,
+    "severidad_minima": "ALTA"
+  },
+
+  "Botón de pánico": {
+    "enviar_telegram": true,
+    "severidad_minima": "CRITICA"
+  },
+
+  "Alarma silenciosa": {
+    "enviar_telegram": true,
+    "severidad_minima": "CRITICA"
+  },
+  "Barrera láser": {
+    "enviar_telegram": true,
+    "severidad_minima": "ALTA"
+  },
+  "Reconocimiento de placas": {
+    "enviar_telegram": true,
+    "severidad_minima": "ALTA"
+  }
+}
+
+}

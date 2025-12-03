@@ -5,7 +5,14 @@ import os, sys, json, sqlite3, threading, socket, time, hashlib
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
-
+import requests  # si no lo tienes
+from telegram_channel import TelegramNotificationChannel
+from notificaciones_config import (
+    cargar_config_dict,
+    guardar_config_dict,
+    preparar_codigo_enlace
+)
+from telegram_helpers import enviar_telegram_si_corresponde
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -28,6 +35,34 @@ try:
 except Exception:
     HAS_MPL = False
 
+# Soporte para OpenCV (cámara de la PC)
+HAS_CV2 = True
+try:
+    import cv2
+except Exception:
+    HAS_CV2 = False
+
+HAS_PYTESS = True
+try:
+    import pytesseract
+    from pytesseract import TesseractNotFoundError
+
+    # Intentar configurar automáticamente la ruta de tesseract en Windows
+    if os.name == "nt":
+        posibles_rutas = [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        ]
+        for ruta in posibles_rutas:
+            if os.path.exists(ruta):
+                pytesseract.pytesseract.tesseract_cmd = ruta
+                break
+except Exception:
+    HAS_PYTESS = False
+
+import re
+
+
 DB_PATH = os.path.join(os.path.dirname(__file__), 'ving.db')
 
 SCHEMA_SQL = r"""
@@ -39,6 +74,16 @@ CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id 
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
 CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,ts TEXT NOT NULL,channel TEXT NOT NULL,priority TEXT NOT NULL,title TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL,FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS plates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    plate TEXT NOT NULL,
+    alias TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+    UNIQUE(user_id, plate)
+);
+
 """
 
 def hash_password(pw: str) -> str:
@@ -150,6 +195,55 @@ class Repo:
     def add_notification(self, user_id: int, channel: str, priority: str, title: str, body: str, status: str):
         with sqlite3.connect(self.path) as cx:
             cx.execute("INSERT INTO notifications (user_id, ts, channel, priority, title, body, status) VALUES (?,?,?,?,?,?,?)",(user_id, utcnow_str(), channel, priority, title, body, status))
+        # --------- Placas autorizadas (LPR) ---------
+
+    def add_plate(self, user_id: int, plate: str, alias: str = "") -> int:
+        plate = plate.strip().upper()
+        if not plate:
+            raise ValueError("La placa no puede estar vacía")
+
+        with sqlite3.connect(self.path) as cx:
+            cx.row_factory = sqlite3.Row
+            try:
+                cur = cx.execute(
+                    "INSERT INTO plates (user_id, plate, alias, created_at) "
+                    "VALUES (?,?,?,?)",
+                    (user_id, plate, alias, utcnow_str()
+                                )
+                                )
+                return cur.lastrowid
+            except sqlite3.IntegrityError:
+                raise ValueError("Esa placa ya está registrada")
+
+    def list_plates(self, user_id: int):
+        with sqlite3.connect(self.path) as cx:
+            cx.row_factory = sqlite3.Row
+            cur = cx.execute(
+                "SELECT * FROM plates WHERE user_id=? ORDER BY plate",
+                (user_id,)
+            )
+            return list(cur.fetchall())
+
+    def delete_plate(self, user_id: int, plate: str):
+        plate = plate.strip().upper()
+        with sqlite3.connect(self.path) as cx:
+            cx.execute(
+                "DELETE FROM plates WHERE user_id=? AND plate=?",
+                (user_id, plate)
+            )
+
+    def find_plate(self, user_id: int, plate: str):
+        plate = plate.strip().upper()
+        with sqlite3.connect(self.path) as cx:
+            cx.row_factory = sqlite3.Row
+            return cx.execute(
+                "SELECT * FROM plates WHERE user_id=? AND plate=?",
+                (user_id, plate)
+            ).fetchone()
+
+    def is_plate_authorized(self, user_id: int, plate: str) -> bool:
+        return self.find_plate(user_id, plate) is not None
+
 
 @dataclass
 class User:
@@ -292,12 +386,32 @@ class DevicesTab(ttk.Frame):
         DeviceEditDialog(self, self.repo, device_id=did, on_saved=lambda: (self.banner.show("Dispositivo actualizado", 'success'), self.refresh()))
     def _toggle_arm(self):
         did = self._selected_id()
-        if not did: return
-        row = self.repo.get_device(did); newv = not bool(row['armed'])
-        self.repo.set_device_armed(did, newv); state = 'Armado' if newv else 'Desarmado'
+        if not did:
+            return
+
+        row = self.repo.get_device(did)
+        newv = not bool(row['armed'])
+
+        self.repo.set_device_armed(did, newv)
+        state = 'Armado' if newv else 'Desarmado'
+
         self.banner.show(f"{row['alias']}: {state}", 'info')
-        self.repo.add_event(self.user.id, did, type_='arm_state', severity='low', message=f"Sistema {state.lower()}", image_path=None, extra={})
+        self.repo.add_event(
+            self.user.id,
+            did,
+            type_='arm_state',
+            severity='low',
+            message=f"Sistema {state.lower()}",
+            image_path=None,
+            extra={}
+        )
+
         self.refresh()
+
+        # 🔔 Avisar al MainView para que actualice las pestañas de tipo
+        if self.on_event:
+            self.on_event('devices_changed')
+
     def _open_sched(self):
         did = self._selected_id()
         if not did: return
@@ -326,6 +440,10 @@ class MotionSensorTab(ttk.Frame):
             self.listbox.insert("end", f"{r['ts']} — {r['message']}")
 
         self.after(2000, self.update_events)
+
+    def refresh_state(self):
+        pass
+
 
 class DeviceAddDialog(tk.Toplevel):
     def __init__(self, master, repo: Repo, user: User, on_saved=None):
@@ -721,7 +839,7 @@ class WiFiPicoBridge:
 
 
 class UsbPicoLink:
-    def __init__(self, port="COM5", baud=115200):
+    def __init__(self, port="5", baud=115200):
         self.port=port; self.baud=baud; self.ser=None
     def open(self):
         try:
@@ -811,6 +929,293 @@ class LockTab(ttk.Frame):
         self.repo.add_event(self.user.id, did, 'lock', 'low', "Cerradura locked [HW]", None, {"by":"desktop"})
         self.banner.show("Cerradura cerrada (90°)", 'success'); self.state_lbl.config(text="Estado: cerrada (90°)"); play_beep(740, 140)
 
+class LprTab(ttk.Frame):
+    """
+    Pestaña específica para reconocimiento de placas (LPR) con cámara de la PC.
+    - Permite registrar placas autorizadas.
+    - Usa la cámara para leer la placa (OCR con Tesseract).
+    - Genera eventos y alertas si la placa NO está registrada.
+    """
+    DEVICE_TYPE = "Reconocimiento de placas"
+
+    def __init__(self, master, repo: Repo, user: User, banner: Banner):
+        super().__init__(master)
+        self.repo = repo
+        self.user = user
+        self.banner = banner
+
+        self._cam_thread = None
+        self._stop_flag = False
+        self._last_detection_time = 0.0
+
+        # ----- Info general -----
+        info = ttk.Frame(self, padding=10)
+        info.pack(fill="x")
+        ttk.Label(
+            info,
+            text="Panel específico — Reconocimiento de placas (cámara PC + OCR)",
+            font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w")
+
+        if not HAS_CV2 or not HAS_PYTESS:
+            msg = "Requiere OpenCV y pytesseract instalados."
+            ttk.Label(info, text=msg, foreground="red").pack(anchor="w")
+
+        # ----- Placas autorizadas -----
+        frm_auth = ttk.LabelFrame(self, text="Placas autorizadas", padding=10)
+        frm_auth.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(frm_auth, text="Placa:").grid(row=0, column=0, padx=4, pady=4, sticky="e")
+        self.e_plate_auth = ttk.Entry(frm_auth, width=12)
+        self.e_plate_auth.grid(row=0, column=1, padx=4, pady=4)
+
+        ttk.Label(frm_auth, text="Alias (opcional):").grid(row=0, column=2, padx=4, pady=4, sticky="e")
+        self.e_alias_auth = ttk.Entry(frm_auth, width=20)
+        self.e_alias_auth.grid(row=0, column=3, padx=4, pady=4)
+
+        ttk.Button(
+            frm_auth,
+            text="Agregar placa autorizada",
+            command=self._add_plate
+        ).grid(row=0, column=4, padx=6, pady=4)
+
+        self.list_auth = tk.Listbox(frm_auth, height=6)
+        self.list_auth.grid(row=1, column=0, columnspan=4, sticky="nsew", padx=4, pady=4)
+
+        ttk.Button(
+            frm_auth,
+            text="Eliminar seleccionada",
+            command=self._del_plate
+        ).grid(row=1, column=4, padx=6, pady=4, sticky="n")
+
+        frm_auth.columnconfigure(3, weight=1)
+        frm_auth.rowconfigure(1, weight=1)
+
+        # ----- Cámara LPR -----
+        frm_cam = ttk.LabelFrame(self, text="Cámara LPR (PC)", padding=10)
+        frm_cam.pack(fill="x", padx=10, pady=5)
+
+        self.lbl_devices = ttk.Label(frm_cam, text="")
+        self.lbl_devices.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+
+        self.btn_start = ttk.Button(
+            frm_cam,
+            text="Iniciar cámara LPR",
+            command=self._start_camera
+        )
+        self.btn_start.grid(row=1, column=0, padx=4, pady=4)
+
+        self.btn_stop = ttk.Button(
+            frm_cam,
+            text="Detener cámara LPR",
+            command=self._stop_camera,
+            state="disabled"
+        )
+        self.btn_stop.grid(row=1, column=1, padx=4, pady=4)
+
+        self.lbl_result = ttk.Label(frm_cam, text="No hay lecturas todavía.", padding=8)
+        self.lbl_result.grid(row=2, column=0, columnspan=3, sticky="w")
+
+        # Cargar datos iniciales
+        self._reload_auth()
+        self.refresh_state()
+
+    # ---------- Gestión de placas autorizadas ----------
+
+    def _reload_auth(self):
+        self.list_auth.delete(0, "end")
+        rows = self.repo.list_plates(self.user.id)
+        for r in rows:
+            alias = r["alias"] or ""
+            txt = r["plate"] if not alias else f"{r['plate']} — {alias}"
+            self.list_auth.insert("end", txt)
+
+    def _add_plate(self):
+        plate = self.e_plate_auth.get().strip().upper()
+        alias = self.e_alias_auth.get().strip()
+        if not plate:
+            self.banner.show("Ingresa una placa para registrar", "warning")
+            return
+        try:
+            self.repo.add_plate(self.user.id, plate, alias)
+        except ValueError as ex:
+            self.banner.show(str(ex), "danger")
+            return
+        self.e_plate_auth.delete(0, "end")
+        self.e_alias_auth.delete(0, "end")
+        self._reload_auth()
+        self.banner.show(f"Placa {plate} registrada como autorizada", "success")
+
+    def _del_plate(self):
+        sel = self.list_auth.curselection()
+        if not sel:
+            return
+        txt = self.list_auth.get(sel[0])
+        plate = txt.split("—")[0].strip().upper()
+        self.repo.delete_plate(self.user.id, plate)
+        self._reload_auth()
+        self.banner.show(f"Placa {plate} eliminada de autorizadas", "info")
+
+    # ---------- Utilidades de dispositivos ----------
+
+    def _device_count(self) -> int:
+        return self.repo.count_devices_by_type(self.user.id, self.DEVICE_TYPE)
+
+    def _pick_device(self) -> Optional[int]:
+        with sqlite3.connect(self.repo.path) as cx:
+            cx.row_factory = sqlite3.Row
+            r = cx.execute(
+                "SELECT id FROM devices WHERE user_id=? AND type=? ORDER BY id LIMIT 1",
+                (self.user.id, self.DEVICE_TYPE)
+            ).fetchone()
+            return r["id"] if r else None
+
+    # ---------- API llamada desde MainView ----------
+
+    def refresh_state(self):
+        cnt = self._device_count()
+        if cnt <= 0:
+            self.lbl_devices.configure(
+                text="No hay dispositivo de tipo 'Reconocimiento de placas'. "
+                     "Registra uno en la pestaña Dispositivos.",
+                foreground="gray"
+            )
+        else:
+            self.lbl_devices.configure(
+                text=f"Hay {cnt} dispositivo(s) de tipo '{self.DEVICE_TYPE}'.",
+                foreground="black"
+            )
+
+    # ---------- Cámara LPR ----------
+
+    def _start_camera(self):
+        if not HAS_CV2 or not HAS_PYTESS:
+            self.banner.show("Falta OpenCV o pytesseract para usar la cámara LPR", "danger")
+            return
+        if self._cam_thread and self._cam_thread.is_alive():
+            return
+        self._stop_flag = False
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        t = threading.Thread(target=self._camera_loop, daemon=True)
+        self._cam_thread = t
+        t.start()
+        self.banner.show("Cámara LPR iniciada (ventana de OpenCV).", "info")
+
+    def _stop_camera(self):
+        self._stop_flag = True
+        self.btn_start.configure(state="normal")
+        self.btn_stop.configure(state="disabled")
+        self.banner.show("Cámara LPR detenida.", "info")
+
+    def _camera_loop(self):
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            self._update_result("No se pudo abrir la cámara de la PC.")
+            self._stop_camera()
+            return
+
+        COOLDOWN = 5.0  # segundos entre detecciones
+        regex_plate = re.compile(r"[A-Z0-9]{5,8}")
+
+        while not self._stop_flag:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Mostrar la imagen en una ventana aparte
+            cv2.imshow("LPR - Cámara PC", frame)
+            if cv2.waitKey(30) & 0xFF == 27:  # ESC para cerrar manualmente
+                self._stop_flag = True
+                break
+
+            # Región central donde esperamos la placa (simulación)
+            h, w, _ = frame.shape
+            y1, y2 = int(h * 0.4), int(h * 0.7)
+            x1, x2 = int(w * 0.2), int(w * 0.8)
+            roi = frame[y1:y2, x1:x2]
+
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            _, thresh = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY)
+
+            # ----- OCR con manejo de errores -----
+            try:
+                text_raw = pytesseract.image_to_string(
+                    thresh,
+                    config="--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+                )
+            except TesseractNotFoundError:
+                # Error típico: tesseract no instalado o no en PATH
+                self._update_result("Error: Tesseract no está instalado o no está en el PATH.")
+                self.banner.show("Error de Tesseract: verifica la instalación y la ruta.", "danger")
+                self._stop_flag = True
+                break
+            except Exception as e:
+                # Cualquier otro error de OCR: lo mostramos pero no crasheamos
+                self._update_result(f"Error de OCR: {e}")
+                # Continuamos con el siguiente frame
+                continue
+
+            text_raw = text_raw.strip().upper().replace(" ", "")
+
+            match = regex_plate.search(text_raw)
+            if match:
+                plate = match.group(0)
+                now = time.time()
+                if now - self._last_detection_time > COOLDOWN:
+                    self._handle_plate_detected(plate)
+                    self._last_detection_time = now
+
+        cap.release()
+        # Destruir la ventana de forma segura (puede no existir)
+        try:
+            cv2.destroyWindow("LPR - Cámara PC")
+        except Exception:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+
+    def _update_result(self, text: str):
+        self.after(0, lambda: self.lbl_result.configure(text=text))
+
+    def _handle_plate_detected(self, plate: str):
+        autorizado = self.repo.is_plate_authorized(self.user.id, plate)
+        did = self._pick_device()
+
+        msg = (
+            f"Placa {plate} autorizada"
+            if autorizado
+            else f"Placa {plate} NO autorizada"
+        )
+        severity = "low" if autorizado else "high"
+
+        self.repo.add_event(
+            self.user.id,
+            did,
+            type_="lpr",
+            severity=severity,
+            message=msg,
+            image_path=None,
+            extra={"plate": plate, "authorized": autorizado, "source": "desktop_lpr_cam"}
+        )
+
+        if not autorizado:
+            self.repo.add_notification(
+                self.user.id,
+                channel="inapp",
+                priority="alta",
+                title="LPR",
+                body=f"Vehículo NO registrado ({plate})",
+                status="sent"
+            )
+            self.banner.show(msg, "priority")
+        else:
+            self.banner.show(msg, "info")
+
+        self._update_result(msg)
+
+
 class DeviceTypeTab(ttk.Frame):
     def __init__(
         self,
@@ -891,6 +1296,263 @@ class DeviceTypeTab(ttk.Frame):
             if r: did = r['id']
         self.repo.add_event(self.user.id, did, 'generic', 'low', f"Evento simulado para tipo {self.device_type}", None, {})
         self.banner.show(f"Evento simulado ({self.device_type})", 'info'); play_beep(900, 120)
+
+class CameraTab(ttk.Frame):
+    """
+    Pestaña específica para 'Cámara con foto por movimiento'.
+    - Solo se activa si hay al menos una cámara registrada y ARMADA.
+    - Usa la cámara de la PC (cv2.VideoCapture(0)).
+    - Cuando detecta movimiento, guarda foto y registra evento en la bitácora.
+    """
+    DEVICE_TYPE = "Cámara con foto por movimiento"
+
+    def __init__(self, master, repo: Repo, user: User, banner: Banner):
+        super().__init__(master)
+        self.repo = repo
+        self.user = user
+        self.banner = banner
+
+        self._cam_thread = None
+        self._stop_flag = False
+
+        info = ttk.Frame(self, padding=10)
+        info.pack(fill="x")
+        ttk.Label(
+            info,
+            text="Panel específico — Cámara con foto por movimiento",
+            font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w")
+
+        self.lbl_status = ttk.Label(self, text="", padding=10)
+        self.lbl_status.pack(anchor="w")
+
+        if not HAS_CV2:
+            self._set_status(
+                "OpenCV no está disponible. Instala con: "
+                "python -m pip install opencv-python"
+            )
+        else:
+            self._set_status(
+                "Esperando que registres una cámara y la marques como Armado."
+            )
+
+        # Para que MainView pueda llamarlo en _refresh_type_tabs
+        self.refresh_state()
+
+    # ---------- utilidades internas ----------
+
+    def _set_status(self, text: str):
+        # Aseguramos modificar el label desde el hilo de Tkinter
+        self.after(0, lambda: self.lbl_status.config(text=text))
+
+    def _has_armed_camera(self) -> bool:
+        """¿Hay al menos una cámara de este tipo armada para este usuario?"""
+        with sqlite3.connect(self.repo.path) as cx:
+            cx.row_factory = sqlite3.Row
+            r = cx.execute(
+                "SELECT 1 FROM devices "
+                "WHERE user_id=? AND type=? AND armed=1 "
+                "LIMIT 1",
+                (self.user.id, self.DEVICE_TYPE)
+            ).fetchone()
+            return bool(r)
+
+    def _get_first_armed_camera_id(self) -> Optional[int]:
+        with sqlite3.connect(self.repo.path) as cx:
+            cx.row_factory = sqlite3.Row
+            r = cx.execute(
+                "SELECT id FROM devices "
+                "WHERE user_id=? AND type=? AND armed=1 "
+                "ORDER BY id LIMIT 1",
+                (self.user.id, self.DEVICE_TYPE)
+            ).fetchone()
+            return r["id"] if r else None
+
+    # ---------- API llamada desde MainView ----------
+
+    def refresh_state(self):
+        """
+        Llamado cuando cambian los dispositivos (armado/desarmado).
+        Arranca o detiene el hilo de la cámara según corresponda.
+        """
+        if not HAS_CV2:
+            # Si no hay OpenCV, no hacemos nada más
+            return
+
+        if self._has_armed_camera():
+            self._start_watcher()
+            self._set_status(
+                "Cámara armada: detección de movimiento activa "
+                "(usando la cámara de la PC)."
+            )
+        else:
+            self._stop_watcher()
+            self._set_status(
+                "No hay cámara armada.\n"
+                "Registra un dispositivo de tipo "
+                "'Cámara con foto por movimiento' y márcalo como Armado."
+            )
+
+    # ---------- manejo del hilo de vigilancia ----------
+
+    def _start_watcher(self):
+        if self._cam_thread and self._cam_thread.is_alive():
+            return  # ya está corriendo
+        self._stop_flag = False
+        t = threading.Thread(target=self._camera_loop, daemon=True)
+        self._cam_thread = t
+        t.start()
+
+    def _stop_watcher(self):
+        self._stop_flag = True
+
+    # ---------- bucle principal de la cámara ----------
+
+    def _camera_loop(self):
+        """
+        Bucle de vigilancia:
+        - Abre la cámara de la PC.
+        - Compara frames consecutivos.
+        - Si hay mucho cambio, asume movimiento, guarda foto y registra evento.
+        """
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            self._set_status("No se pudo abrir la cámara de la PC.")
+            return
+
+        ret, frame_prev = cap.read()
+        if not ret:
+            self._set_status("No se pudo leer el primer fotograma de la cámara.")
+            cap.release()
+            return
+
+        frame_prev_gray = cv2.cvtColor(frame_prev, cv2.COLOR_BGR2GRAY)
+        frame_prev_gray = cv2.GaussianBlur(frame_prev_gray, (21, 21), 0)
+
+        MOTION_THRESHOLD = 5000      # píxeles "diferentes" para considerar movimiento
+        COOLDOWN_SECONDS = 3.0       # tiempo mínimo entre fotos
+        last_capture_time = 0.0
+
+        while not self._stop_flag:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (21, 21), 0)
+
+            frame_delta = cv2.absdiff(frame_prev_gray, gray)
+            _, thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)
+            motion_pixels = cv2.countNonZero(thresh)
+
+            if motion_pixels > MOTION_THRESHOLD:
+                now = time.time()
+                if now - last_capture_time > COOLDOWN_SECONDS:
+                    did = self._get_first_armed_camera_id()
+                    if did is None:
+                        # Ya no hay cámara armada, salimos del bucle
+                        self._set_status(
+                            "No hay cámara armada, deteniendo vigilancia."
+                        )
+                        break
+
+                    # Carpeta donde se guardan las fotos
+                    captures_dir = os.path.join(
+                        os.path.dirname(__file__), "capturas_pc_cam"
+                    )
+                    os.makedirs(captures_dir, exist_ok=True)
+
+                    filename = time.strftime("cam_%Y%m%d_%H%M%S.jpg")
+                    full_path = os.path.join(captures_dir, filename)
+
+                    try:
+                        cv2.imwrite(full_path, frame)
+                    except Exception:
+                        # Si falla, no queremos romper el hilo
+                        pass
+
+                    msg = f"Movimiento detectado en cámara. Foto: {filename}"
+
+                    # 1) Registrar en bitácora
+                    self.repo.add_event(
+                        self.user.id,
+                        did,
+                        type_="camera_motion",
+                        severity="high",
+                        message=msg,
+                        image_path=full_path,
+                        extra={"source": "pc_camera"}
+                    )
+
+                    # 2) Mostrar en la interfaz
+                    self.banner.show(msg, "info")
+
+                    # 3) Enviar también a Telegram (si está configurado)
+                    try:
+                        cfg = cargar_config_dict()
+                        if not cfg.get("telegram_habilitado"):
+                            # El usuario no ha activado Telegram
+                            continue
+
+                        bot_token = cfg.get("bot_token")
+                        chat_id = cfg.get("telegram_chat_id")
+                        if not bot_token or not chat_id:
+                            # Falta token o chat vinculado
+                            continue
+
+                        dispositivo = "Cámara con foto por movimiento"
+
+                        # Ver preferencias por dispositivo
+                        disp_cfg = cfg.get("dispositivos", {}).get(dispositivo, {})
+                        if not disp_cfg.get("enviar_telegram", False):
+                            # Este dispositivo está desactivado para Telegram
+                            continue
+
+                        # Filtro por severidad mínima (INFO / ALTA / CRITICA)
+                        severidad_actual = "high"       # la que usamos en add_event
+                        mapa_valor = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+                        mapa_min = {"INFO": 1, "ALTA": 3, "CRITICA": 4}
+                        sev_min = disp_cfg.get("severidad_minima", "ALTA").upper()
+
+                        # Si el evento es crítico y está activado "siempre_enviar_criticos", pasa directo
+                        if not (severidad_actual == "critical" and cfg.get("siempre_enviar_criticos", True)):
+                            if mapa_valor.get(severidad_actual, 1) < mapa_min.get(sev_min, 1):
+                                # severidad demasiado baja para enviarse
+                                continue
+
+                        canal = TelegramNotificationChannel(bot_token)
+                        canal.enviar_evento(
+                            chat_id=chat_id,
+                            dispositivo=dispositivo,
+                            severidad=severidad_actual,
+                            titulo="Movimiento en cámara",
+                            cuerpo=msg
+                        )
+                    except Exception as e:
+                        print("Error al enviar a Telegram desde CameraTab:", e)
+
+
+                    # Notificación en la app
+                    self.repo.add_notification(
+                        self.user.id,
+                        channel="inapp",
+                        priority="alta",
+                        title="Movimiento en cámara",
+                        body=msg,
+                        status="sent"
+                    )
+
+                    # Mostrar algo en la pestaña
+                    self._set_status(f"Última captura: {filename}")
+
+                    last_capture_time = now
+
+            frame_prev_gray = gray
+            time.sleep(0.1)
+
+        cap.release()
+
+
 
 class PresenceSimTab(ttk.Frame):
     """
@@ -1016,6 +1678,47 @@ class PresenceSimTab(ttk.Frame):
     # Enviar configuración de horarios (modo automático)
     # Formato: hora_now;min_now;hora_on;min_on;hora_off;min_off
     # -------------------------------------------------
+    def _registrar_evento_presencia(self, estado: str):
+        """
+        estado: 'encendida' o 'apagada'
+        """
+        did = None
+        # Buscar, si existe, un dispositivo de tipo "Simulador de presencia"
+        with sqlite3.connect(self.repo.path) as cx:
+            cx.row_factory = sqlite3.Row
+            r = cx.execute(
+                "SELECT id FROM devices WHERE user_id=? AND type=? ORDER BY id LIMIT 1",
+                (self.user.id, "Simulador de presencia")
+            ).fetchone()
+            if r:
+                did = r["id"]
+
+        msg = f"Simulador de presencia: luz {estado}"
+
+        # Evento en bitácora
+        self.repo.add_event(
+            self.user.id,
+            did,
+            type_="presence",
+            severity="low",
+            message=msg,
+            image_path=None,
+            extra={"source": "presence_tab", "state": estado}
+        )
+
+        # Notificación (como hace QuickActions._notify)
+        self.repo.add_notification(
+            self.user.id,
+            channel="inapp",
+            priority="normal",
+            title="Presencia",
+            body=msg,
+            status="sent"
+        )
+
+        # Banner en pantalla
+        self.banner.show(msg, "info")
+
     def enviar_config(self):
         try:
             hour_now    = int(self.entryHourNow.get())
@@ -1044,6 +1747,8 @@ class PresenceSimTab(ttk.Frame):
             "Comando ON enviado a la Pico.",
             "Error ON"
         )
+        # NUEVO: registrar evento y notificación
+        self._registrar_evento_presencia("encendida")
 
     # -------------------------------------------------
     # Apagar LED en modo manual
@@ -1054,49 +1759,307 @@ class PresenceSimTab(ttk.Frame):
             "Comando OFF enviado a la Pico.",
             "Error OFF"
         )
+        # NUEVO: registrar evento y notificación
+        self._registrar_evento_presencia("apagada")
+
+
+# Constantes de nombres de dispositivo para NO equivocarnos
+DEVICE_MOV = "Detector de movimiento"
+DEVICE_SMOKE = "Sensor de humo"
+DEVICE_CAMERA = "Cámara con foto por movimiento"
+DEVICE_PRESENCE = "Simulador de presencia"
+DEVICE_SILENT_PANIC = "Silenciosa"            # tipo usado en la BD
+DEVICE_DOORWIN = "Puertas/ventanas"
+DEVICE_SILENT_ALARM = "Alarma silenciosa"
+DEVICE_LASER = "Barrera láser"
+DEVICE_LPR = "Reconocimiento de placas"
 
 
 class QuickActions(ttk.Frame):
     def __init__(self, master, repo: Repo, user: User, banner: Banner):
-        super().__init__(master); self.repo=repo; self.user=user; self.banner=banner
-        ttk.Label(self, text="Simulador de dispositivos (para pruebas)", font=("Segoe UI", 10, 'bold')).pack(anchor='w', padx=8, pady=(8,0))
-        grid = ttk.Frame(self); grid.pack(fill='x', padx=8, pady=6)
-        buttons = [("Detector movimiento", self.detect_motion),("Humo detectado", self.smoke_alert),("Cámara: foto por mov.", self.camera_capture),("Simulador presencia", self.presence_tick),("Botón de pánico", self.panic_button),("Puerta/ventana cambio", self.door_window_toggle),("Alarma silenciosa", self.silent_alarm),("Barrera láser", self.laser_barrier),("LPR (placa)", self.lpr_event)]
-        for i,(txt,cmd) in enumerate(buttons): ttk.Button(grid, text=txt, command=cmd).grid(row=i//2, column=i%2, sticky='ew', padx=4, pady=4)
-        for c in range(2): grid.columnconfigure(c, weight=1)
-    def _pick_device(self, type_hint: Optional[str]=None) -> Optional[int]:
+        super().__init__(master)
+        self.repo = repo
+        self.user = user
+        self.banner = banner
+
+        ttk.Label(
+            self,
+            text="Simulador de dispositivos (para pruebas)",
+            font=("Segoe UI", 10, 'bold')
+        ).pack(anchor='w', padx=8, pady=(8, 0))
+
+        grid = ttk.Frame(self)
+        grid.pack(fill='x', padx=8, pady=6)
+
+        buttons = [
+            ("Detector movimiento",      self.detect_motion),
+            ("Humo detectado",           self.smoke_alert),
+            ("Cámara: foto por mov.",    self.camera_capture),
+            ("Simulador presencia",      self.presence_tick),
+            ("Silenciosa",               self.panic_button),
+            ("Puerta/ventana cambio",    self.door_window_toggle),
+            ("Boton de panico",          self.silent_alarm),
+            ("Barrera láser",            self.laser_barrier),
+            ("LPR (placa)",              self.lpr_event),
+        ]
+
+        for i, (txt, cmd) in enumerate(buttons):
+            ttk.Button(grid, text=txt, command=cmd).grid(
+                row=i // 2, column=i % 2, sticky='ew', padx=4, pady=4
+            )
+        for c in range(2):
+            grid.columnconfigure(c, weight=1)
+
+    def _pick_device(self, type_hint: Optional[str] = None) -> Optional[int]:
         with sqlite3.connect(self.repo.path) as cx:
             cx.row_factory = sqlite3.Row
             if type_hint:
-                r = cx.execute("SELECT id FROM devices WHERE user_id=? AND type=? ORDER BY id LIMIT 1",(self.user.id, type_hint)).fetchone()
-                if r: return r['id']
-            r = cx.execute("SELECT id FROM devices WHERE user_id=? ORDER BY id LIMIT 1",(self.user.id,)).fetchone()
-            return r['id'] if r else None
-    def _notify(self, title: str, body: str, priority=False):
-        self.repo.add_notification(self.user.id, 'inapp', 'alta' if priority else 'normal', title, body, 'sent')
-        self.banner.show(f"{title}: {body}", 'priority' if priority else 'info')
+                r = cx.execute(
+                    "SELECT id FROM devices WHERE user_id=? AND type=? ORDER BY id LIMIT 1",
+                    (self.user.id, type_hint)
+                ).fetchone()
+                if r:
+                    return r["id"]
+            r = cx.execute(
+                "SELECT id FROM devices WHERE user_id=? ORDER BY id LIMIT 1",
+                (self.user.id,)
+            ).fetchone()
+            return r["id"] if r else None
+
+    def _notify(self, title: str, body: str, priority: bool = False):
+        self.repo.add_notification(
+            self.user.id,
+            "inapp",
+            "alta" if priority else "normal",
+            title,
+            body,
+            "sent",
+        )
+        self.banner.show(
+            f"{title}: {body}",
+            "priority" if priority else "info"
+        )
+
+    # ------------------ Simulaciones con Telegram extra ------------------ #
+
     def detect_motion(self):
-        did = self._pick_device("Detector de movimiento"); self.repo.add_event(self.user.id, did, 'motion', 'high', 'Movimiento detectado', None, {}); self._notify('Movimiento', 'Se detectó movimiento', priority=True); play_beep(1200, 250)
+        did = self._pick_device(DEVICE_MOV)
+        self.repo.add_event(
+            self.user.id,
+            did,
+            "motion",
+            "high",
+            "Movimiento detectado",
+            None,
+            {},
+        )
+        self._notify("Movimiento", "Se detectó movimiento", priority=True)
+        enviar_telegram_si_corresponde(
+            dispositivo=DEVICE_MOV,
+            severidad="high",
+            titulo="Movimiento detectado",
+            cuerpo="Se detectó movimiento en el área protegida."
+        )
+        play_beep(1200, 250)
+
     def smoke_alert(self):
-        did = self._pick_device("Sensor de humo"); self.repo.add_event(self.user.id, did, 'smoke', 'critical', 'Humo detectado', None, {}); self._notify('Humo', '¡Alerta crítica!', priority=True); play_beep(1400, 300)
+        did = self._pick_device(DEVICE_SMOKE)
+        self.repo.add_event(
+            self.user.id,
+            did,
+            "smoke",
+            "critical",
+            "Humo detectado",
+            None,
+            {},
+        )
+        self._notify("Humo", "¡Alerta crítica!", priority=True)
+        enviar_telegram_si_corresponde(
+            dispositivo=DEVICE_SMOKE,
+            severidad="critical",
+            titulo="Humo detectado",
+            cuerpo="El sensor reporta presencia de humo."
+        )
+        play_beep(1400, 300)
+
     def camera_capture(self):
-        did = self._pick_device("Cámara con foto por movimiento"); self.repo.add_event(self.user.id, did, 'camera', 'high', 'Foto capturada por movimiento', None, {}); self._notify('Cámara', 'Imagen adjunta')
-    def presence_tick(self): did = self._pick_device("Simulador de presencia"); self.repo.add_event(self.user.id, did, 'presence', 'low', 'Simulador accionó luz', None, {}); self._notify('Presencia', 'Luz conmutada')
-    def panic_button(self): did = self._pick_device("Botón de pánico"); self.repo.add_event(self.user.id, did, 'panic', 'critical', 'Botón de pánico activado', None, {}); self._notify('Pánico', 'Alerta urgente', priority=True); play_beep(1600, 400)
+        did = self._pick_device(DEVICE_CAMERA)
+        self.repo.add_event(
+            self.user.id,
+            did,
+            "camera",
+            "high",
+            "Foto capturada por movimiento",
+            None,
+            {},
+        )
+        self._notify("Cámara", "Imagen adjunta")
+        enviar_telegram_si_corresponde(
+            dispositivo=DEVICE_CAMERA,
+            severidad="high",
+            titulo="Movimiento en cámara",
+            cuerpo="Se capturó una imagen por detección de movimiento (simulada)."
+        )
+
+    def presence_tick(self):
+        did = self._pick_device(DEVICE_PRESENCE)
+        self.repo.add_event(
+            self.user.id,
+            did,
+            "presence",
+            "low",
+            "Simulador accionó luz",
+            None,
+            {},
+        )
+        self._notify("Presencia", "Luz conmutada")
+        enviar_telegram_si_corresponde(
+            dispositivo=DEVICE_PRESENCE,
+            severidad="low",
+            titulo="Simulador de presencia",
+            cuerpo="El simulador de presencia accionó una luz."
+        )
+
+    def panic_button(self):
+        # Dispositivo tipo "Botón de pánico" en la BD
+        did = self._pick_device("Botón de pánico")
+
+        self.repo.add_event(
+            self.user.id,
+           did,
+           "panic",
+          "critical",
+          "Botón de pánico activado",
+           None,
+           {},
+     )
+
+        self._notify("Botón de pánico", "Alerta urgente", priority=True)
+
+        # Notificación a Telegram: se mapea al dispositivo "Botón de pánico"
+        enviar_telegram_si_corresponde(
+         dispositivo="Botón de pánico",
+         severidad="critical",
+         titulo="Botón de pánico",
+         cuerpo="Se activó el botón de pánico."
+     )
+
+        play_beep(1600, 400)
+
+
     def door_window_toggle(self):
-        did = self._pick_device("Puertas/ventanas"); row = self.repo.get_device(did) if did else None; new_state = 'open' if (row and row['status']!='open') else 'closed'
-        if did: self.repo.set_device_status(did, new_state)
-        self.repo.add_event(self.user.id, did, 'doorwin', 'medium', f"Estado {new_state}", None, {}); self._notify('Puerta/Ventana', f"{new_state}")
+        did = self._pick_device(DEVICE_DOORWIN)
+        row = self.repo.get_device(did) if did else None
+        new_state = "open" if (row and row["status"] != "open") else "closed"
+        if did:
+            self.repo.set_device_status(did, new_state)
+
+        self.repo.add_event(
+            self.user.id,
+            did,
+            "doorwin",
+            "high",   # la subimos a 'high' para que pase sev_min=ALTA
+            f"Estado {new_state}",
+            None,
+            {},
+        )
+        self._notify("Puerta/Ventana", f"{new_state}")
+        enviar_telegram_si_corresponde(
+            dispositivo=DEVICE_DOORWIN,
+            severidad="high",
+            titulo="Puerta/Ventana",
+            cuerpo=f"Estado: {new_state}"
+        )
+
     def silent_alarm(self):
-        did = self._pick_device("Alarma silenciosa"); self.repo.add_event(self.user.id, did, 'silent_alarm', 'critical', 'Alarma silenciosa activada', None, {}); self.banner.show("Alarma silenciosa: alerta enviada", 'priority'); self.repo.add_notification(self.user.id, 'inapp', 'alta', 'Alarma silenciosa', 'Alerta enviada', 'sent')
+        did = self._pick_device("Alarma silenciosa")
+        self.repo.add_event(
+            self.user.id,
+            did,
+            "silent_alarm",
+            "critical",
+            "Alarma silenciosa activada",
+             None,
+             {},
+        )
+        self.banner.show("Alarma silenciosa: alerta enviada", "priority")
+        self.repo.add_notification(
+            self.user.id,
+            "inapp",
+            "alta",
+            "Alarma silenciosa",
+            "Alerta enviada",
+            "sent",
+    )
+
+    # MISMO nombre para TELEGRAM:
+        enviar_telegram_si_corresponde(
+         dispositivo="Alarma silenciosa",
+            severidad="critical",
+            titulo="Alarma silenciosa",
+         cuerpo="Se activó la alarma silenciosa (notificación silenciosa)."
+    )
+
+
     def laser_barrier(self):
-        did = self._pick_device("Barrera láser"); self.repo.add_event(self.user.id, did, 'laser_start', 'high', 'Barrera interrumpida (inicio)', None, {}); self._notify('Barrera láser', 'Interrupción detectada')
-        def end_event(): self.repo.add_event(self.user.id, did, 'laser_end', 'high', 'Barrera interrumpida (fin)', None, {"duration_s":2})
+        did = self._pick_device(DEVICE_LASER)
+        self.repo.add_event(
+            self.user.id,
+            did,
+            "laser_start",
+            "high",
+            "Barrera interrumpida (inicio)",
+            None,
+            {},
+        )
+        self._notify("Barrera láser", "Interrupción detectada")
+        enviar_telegram_si_corresponde(
+            dispositivo=DEVICE_LASER,
+            severidad="high",
+            titulo="Barrera láser",
+            cuerpo="La barrera láser fue interrumpida (inicio)."
+        )
+
+        def end_event():
+            self.repo.add_event(
+                self.user.id,
+                did,
+                "laser_end",
+                "high",
+                "Barrera interrumpida (fin)",
+                None,
+                {"duration_s": 2},
+            )
+
         threading.Timer(2.0, end_event).start()
+
     def lpr_event(self):
-        did = self._pick_device("Reconocimiento de placas"); plate = "ABC123"; authorized = False; msg = f"Placa {plate} {'autorizada' if authorized else 'NO autorizada'}"
-        self.repo.add_event(self.user.id, did, 'lpr', 'high' if not authorized else 'low', msg, None, {"plate": plate, "authorized": authorized})
-        if not authorized: self._notify('LPR', 'Vehículo no registrado', priority=True)
+        # En la BD el tipo es "Reconocimiento de placas"
+        did = self._pick_device("Reconocimiento de placas")
+        plate = "ABC123"
+        authorized = False
+        msg = f"Placa {plate} {'autorizada' if authorized else 'NO autorizada'}"
+
+        self.repo.add_event(
+            self.user.id,
+            did,
+            "lpr",
+            "high" if not authorized else "low",
+            msg,
+            None,
+          {"plate": plate, "authorized": authorized},
+        )
+
+        if not authorized:
+          self._notify("LPR", "Vehículo no registrado", priority=True)
+          enviar_telegram_si_corresponde(
+            dispositivo="Reconocimiento de placas",
+            severidad="high",
+            titulo="Placa NO autorizada",
+            cuerpo=f"Se detectó la placa {plate} no registrada."
+        )
+
+
 
 class MainView(ttk.Frame):
     def __init__(self, master, repo: Repo, user: User, pico_unified:PicoUnified):
@@ -1109,18 +2072,33 @@ class MainView(ttk.Frame):
         self.tab_lock    = LockTab(nb, self.repo, self.user, self.banner, pico=self.pico)
         self.tab_motion = MotionSensorTab(nb, self.repo, self.user, self.banner)
         self.tab_smoke   = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Sensor de humo", title="Panel específico — Sensor de humo")
-        self.tab_camera  = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Cámara con foto por movimiento", title="Panel específico — Cámara con foto por movimiento")
+        self.tab_camera  = CameraTab(nb, self.repo, self.user, self.banner)
         self.tab_presence = PresenceSimTab(nb, self.repo, self.user, self.banner, pico=self.pico)
         self.tab_panic   = DeviceTypeTab(
             nb,
             self.repo,
             self.user,
             self.banner,
-            device_type="Botón de pánico",
-            title="Panel específico — Botón de pánico",
+            device_type="Alarma Silenciosa",
+            title="Panel específico — Alarma silenciosa",
             require_device=False         # ← clave
         )
-        self.tab_panic.btn_action.config(text="ACTIVAR PÁNICO")
+                # Cargar config notificaciones / Telegram
+        try:
+            self.notif_cfg = cargar_config_dict()
+        except Exception:
+            self.notif_cfg = {
+                "bot_token": "",
+                "telegram_habilitado": False,
+                "telegram_chat_id": None,
+                "siempre_enviar_criticos": True,
+                "dispositivos": {}
+            }
+
+        bot_token = self.notif_cfg.get("bot_token") or ""
+        self.telegram_channel = TelegramNotificationChannel(bot_token) if bot_token else None
+
+        self.tab_panic.btn_action.config(text="Activar Alarma silenciosa")
         for c in self.tab_panic.btn_frame.winfo_children():
             c.pack_forget()  # quitamos el pack anterior ("side='left'")
 
@@ -1156,19 +2134,32 @@ class MainView(ttk.Frame):
             self.repo.add_event(
                 self.user.id,
                 did,
-                type_="panic",
+                type_="Silenciosa",
                 severity="critical",
-                message="Botón de pánico activado (panel específico)",
+                message="Alarma Silenciosa activada",
                 image_path=None,
                 extra={"source": "desktop_panic_tab"}
             )
 
             # Mostrar notificación visual y sonora
-            self.banner.show("Botón de pánico ACTIVADO", "priority")
+            self.banner.show("Alarma Silenciosa activada", "priority")
             play_beep(1600, 400)
 
             # Refrescar la bitácora para verlo de una vez
             self.tab_events.refresh()
+                # Botones para Telegram (pueden ir en un frame aparte)
+        frame_tg = ttk.LabelFrame(self, text="Notificaciones Telegram")
+        frame_tg.pack(fill="x", padx=10, pady=10)
+
+        self.var_tg_enabled = tk.BooleanVar(value=self.notif_cfg.get("telegram_habilitado", False))
+        chk = ttk.Checkbutton(frame_tg, text="Habilitar Telegram", variable=self.var_tg_enabled)
+        chk.grid(row=0, column=0, sticky="w", padx=5, pady=5)
+
+        ttk.Button(frame_tg, text="Generar código de enlace",
+                   command=self.generar_codigo_enlace).grid(row=1, column=0, sticky="w", padx=5, pady=5)
+
+        ttk.Button(frame_tg, text="Prueba Telegram",
+                   command=self.probar_telegram).grid(row=1, column=1, sticky="e", padx=5, pady=5)
 
         # Reemplazar el comando del botón genérico por el de pánico
         self.tab_panic.btn_action.configure(command=panic_sim)
@@ -1177,11 +2168,11 @@ class MainView(ttk.Frame):
         self.tab_doorwin = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Puertas/ventanas", title="Panel específico — Puertas/ventanas")
         self.tab_silent  = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Alarma silenciosa", title="Panel específico — Alarma silenciosa")
         self.tab_laser   = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Barrera láser", title="Panel específico — Barrera láser")
-        self.tab_lpr     = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Reconocimiento de placas", title="Panel específico — Reconocimiento de placas")
+        self.tab_lpr     = LprTab(nb, self.repo, self.user, self.banner)
         self.tab_quick   = QuickActions(nb, self.repo, self.user, self.banner)
         nb.add(self.tab_devices, text='Dispositivos'); nb.add(self.tab_events,  text='Bitácora'); nb.add(self.tab_hist,    text='Histograma'); nb.add(self.tab_lock,    text='Cerraduras')
         nb.add(self.tab_motion,  text='Movimiento');  nb.add(self.tab_smoke,   text='Humo');     nb.add(self.tab_camera,  text='Cámara');     nb.add(self.tab_presence,text='Presencia')
-        nb.add(self.tab_panic,   text='Pánico');      nb.add(self.tab_doorwin, text='Puertas/Vent.'); nb.add(self.tab_silent,  text='Silenciosa'); nb.add(self.tab_laser,   text='Láser')
+        nb.add(self.tab_panic,   text='Silenciosa');      nb.add(self.tab_doorwin, text='Puertas/Vent.'); nb.add(self.tab_silent,  text='Silenciosa'); nb.add(self.tab_laser,   text='Láser')
         nb.add(self.tab_lpr,     text='Placas');      nb.add(self.tab_quick,   text='Simulador')
         hdr = ttk.Frame(self, padding=6); hdr.pack(fill='x', side='top')
         ttk.Label(hdr, text=f"Bienvenido, {user.name}", font=("Segoe UI", 12, 'bold')).pack(side='left')
@@ -1196,27 +2187,118 @@ class MainView(ttk.Frame):
         self.tab_lock.refresh_state()
         for tab in (self.tab_motion,self.tab_smoke,self.tab_camera,self.tab_presence,self.tab_panic,self.tab_doorwin,self.tab_silent,self.tab_laser,self.tab_lpr):
             tab.refresh_state()
+    def generar_codigo_enlace(self):
+        try:
+            codigo, expira = preparar_codigo_enlace()
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo generar el código:\n{e}")
+            return
+
+        messagebox.showinfo(
+            "Código de enlace",
+            f"Código: {codigo}\n\n"
+            f"En Telegram, abre tu bot y escribe:\n"
+            f"/link {codigo}\n\n"
+            f"Expira a las {expira.strftime('%H:%M:%S')}."
+        )
+
+    def probar_telegram(self):
+        # Recargar config por si el bot actualizó el chat_id
+        try:
+            self.notif_cfg = cargar_config_dict()
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo leer la config:\n{e}")
+            return
+
+        chat_id = self.notif_cfg.get("telegram_chat_id")
+        bot_token = self.notif_cfg.get("bot_token")
+
+        if not bot_token:
+            messagebox.showerror("Error", "No hay bot_token configurado en notificaciones_config.json.")
+            return
+        if not chat_id:
+            messagebox.showwarning("No vinculado", "Primero vincula el bot con /link desde Telegram.")
+            return
+
+        if not self.telegram_channel:
+            self.telegram_channel = TelegramNotificationChannel(bot_token)
+
+        self.telegram_channel.enviar_texto(chat_id, "🔔 Prueba de notificación desde la app de Cámara Ving.")
+        messagebox.showinfo("Enviado", "Se envió una notificación de prueba a tu Telegram.")
 
 class App(tk.Tk):
     def __init__(self, repo: Repo):
-        super().__init__(); self.geometry('980x720'); self.title('Ving'); self.style = ttk.Style(self)
-        try: self.style.theme_use('clam')
-        except Exception: pass
+        super().__init__()
+        self.geometry('980x720')
+        self.title('Ving')
+        self.style = ttk.Style(self)
+        try:
+            self.style.theme_use('clam')
+        except Exception:
+            pass
         self.repo = repo
         self.wifi = WiFiPicoBridge(host="0.0.0.0", port=12345, repo=self.repo)
-        usb = UsbPicoLink(port="COM5").open()
+        usb = UsbPicoLink(port="COM8").open()
         self.pico = PicoUnified(self.wifi, usb)
         self._show_login()
+
     def _show_login(self):
         for w in self.winfo_children():
-            if isinstance(w, ttk.Notebook) or isinstance(w, ttk.Frame): w.destroy()
+            if isinstance(w, ttk.Notebook) or isinstance(w, ttk.Frame):
+                w.destroy()
         LoginView(self, self.repo, on_login=self._show_main)
+
     def _show_main(self, user: User):
-        for w in self.winfo_children(): w.destroy()
+        for w in self.winfo_children():
+            w.destroy()
         MainView(self, self.repo, user, pico_unified=self.pico)
 
+    def _notify_telegram_event(self, dispositivo: str, severidad: str, titulo: str, cuerpo: str):
+        try:
+            # Recargar config por si cambió
+            self.notif_cfg = cargar_config_dict()
+        except Exception:
+            return
+
+        if not self.notif_cfg.get("telegram_habilitado"):
+            return
+
+        chat_id = self.notif_cfg.get("telegram_chat_id")
+        bot_token = self.notif_cfg.get("bot_token")
+        if not bot_token or not chat_id:
+            return
+
+        if not self.telegram_channel:
+            self.telegram_channel = TelegramNotificationChannel(bot_token)
+
+        disp_cfg = self.notif_cfg.get("dispositivos", {}).get(dispositivo)
+        if not disp_cfg:
+            return
+        if not disp_cfg.get("enviar_telegram", False):
+            return
+
+        # Mapeo severidad (igual que te propuse)
+        mapa_valor = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+        severidad_min = disp_cfg.get("severidad_minima", "ALTA").upper()
+        mapa_min = {"INFO": 1, "ALTA": 3, "CRITICA": 4}
+
+        if severidad == "critical" and self.notif_cfg.get("siempre_enviar_criticos", True):
+            # pase directo
+            self.telegram_channel.enviar_evento(chat_id, dispositivo, severidad, titulo, cuerpo)
+            return
+
+        # Comparar severidad actual vs mínima
+        if mapa_valor.get(severidad, 1) < mapa_min.get(severidad_min, 1):
+            return
+
+        self.telegram_channel.enviar_evento(chat_id, dispositivo, severidad, titulo, cuerpo)
+
+
 def main():
-    repo = Repo(DB_PATH); app = App(repo); app.mainloop()
+    repo = Repo(DB_PATH)
+    app = App(repo)
+    app.mainloop()
+
 
 if __name__ == '__main__':
     main()

@@ -3,6 +3,8 @@ import urllib.request
 import urllib.error
 import json
 
+
+
 class NetworkPicoLink:
     def __init__(self, base_url: str, token: str):
         # base_url ej.: "http://192.168.1.120:8080"
