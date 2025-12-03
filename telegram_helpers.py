@@ -7,15 +7,15 @@ def _normalizar_dispositivo(nombre_crudo: str) -> str:
     """
     Recibe el nombre que venga de la app (QuickActions, simuladores, listas, etc.)
     y lo mapea a un nombre "canónico" que usamos en notificaciones_config.json.
-    Así evitamos problemas entre "LPR (placa)", "Reconocimiento de placas", etc.
     """
     if not nombre_crudo:
         return ""
 
     n = nombre_crudo.strip().lower()
 
-  
+    # LPR / placas
     if "lpr" in n or "placa" in n or "placas" in n:
+        # Usamos el nombre EXACTO que ya tienes en el JSON:
         return "LPR (placa)"
 
     # Botón de pánico
@@ -24,7 +24,6 @@ def _normalizar_dispositivo(nombre_crudo: str) -> str:
 
     # Alarma silenciosa
     if "silenciosa" in n:
-        # Si en algún lado se usa "silenciosa" a secas, la mapeamos a Alarma silenciosa
         return "Alarma silenciosa"
 
     # Puertas y ventanas
@@ -34,7 +33,7 @@ def _normalizar_dispositivo(nombre_crudo: str) -> str:
     # Cámara
     if "cámara" in n or "camara" in n:
         if "placa" in n or "lpr" in n:
-            return "Reconocimiento de placas"
+            return "LPR (placa)"
         return "Cámara con foto por movimiento"
 
     # Humo
@@ -57,7 +56,13 @@ def _normalizar_dispositivo(nombre_crudo: str) -> str:
     return nombre_crudo.strip()
 
 
-def enviar_telegram_si_corresponde(dispositivo: str, severidad: str, titulo: str, cuerpo: str):
+def enviar_telegram_si_corresponde(
+    dispositivo: str,
+    severidad: str,
+    titulo: str,
+    cuerpo: str,
+    image_path: str | None = None,
+):
     """
     Enviar una notificación de Telegram si:
     - Telegram está habilitado
@@ -65,12 +70,16 @@ def enviar_telegram_si_corresponde(dispositivo: str, severidad: str, titulo: str
     - La severidad cumple la severidad mínima configurada
 
     severidad: 'low', 'medium', 'high', 'critical'
+    image_path: ruta a una imagen opcional (para cámaras, etc.)
     """
 
     dispositivo_original = dispositivo or ""
     dispositivo_norm = _normalizar_dispositivo(dispositivo_original)
 
-    print(f"[TG-HELPER] Dispositivo crudo={dispositivo_original!r} -> normalizado={dispositivo_norm!r}, severidad={severidad!r}, titulo={titulo!r}")
+    print(
+        f"[TG-HELPER] Dispositivo crudo={dispositivo_original!r} -> "
+        f"normalizado={dispositivo_norm!r}, severidad={severidad!r}, titulo={titulo!r}"
+    )
 
     try:
         cfg = cargar_config_dict()
@@ -85,11 +94,14 @@ def enviar_telegram_si_corresponde(dispositivo: str, severidad: str, titulo: str
     bot_token = cfg.get("bot_token")
     chat_id = cfg.get("telegram_chat_id")
     if not bot_token or not chat_id:
-        print(f"[TG-HELPER] Falta bot_token o chat_id (bot_token={bool(bot_token)}, chat_id={chat_id})")
+        print(
+            f"[TG-HELPER] Falta bot_token o chat_id "
+            f"(bot_token={bool(bot_token)}, chat_id={chat_id})"
+        )
         return
 
     dispositivos_cfg = cfg.get("dispositivos", {})
-    print(f"[TG-HELPER] Claves en dispositivos:", list(dispositivos_cfg.keys()))
+    print("[TG-HELPER] Claves en dispositivos:", list(dispositivos_cfg.keys()))
 
     disp_cfg = dispositivos_cfg.get(dispositivo_norm)
     if not disp_cfg:
@@ -125,6 +137,7 @@ def enviar_telegram_si_corresponde(dispositivo: str, severidad: str, titulo: str
         dispositivo=dispositivo_norm,
         severidad=severidad_actual,
         titulo=titulo,
-        cuerpo=cuerpo
+        cuerpo=cuerpo,
+        image_path=image_path,  # 👈 AQUI PASAMOS LA FOTO (si hay)
     )
     print("[TG-HELPER] Mensaje enviado (o al menos intentado).")

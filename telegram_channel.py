@@ -1,4 +1,5 @@
 # telegram_channel.py
+import os
 import requests
 from datetime import datetime
 
@@ -6,7 +7,6 @@ from datetime import datetime
 class TelegramNotificationChannel:
     """
     Encapsula el envío de mensajes al bot de Telegram.
-    Se usa desde la app para mandar textos o eventos formateados.
     """
 
     def __init__(self, bot_token: str):
@@ -14,9 +14,6 @@ class TelegramNotificationChannel:
         self.api_url = f"https://api.telegram.org/bot{bot_token}"
 
     def enviar_texto(self, chat_id: int, texto: str):
-        """
-        Envía un mensaje de texto simple a un chat.
-        """
         if not self.bot_token:
             print("TelegramNotificationChannel: bot_token vacío, no se envía nada.")
             return
@@ -30,6 +27,34 @@ class TelegramNotificationChannel:
         except Exception as e:
             print("Error enviando mensaje a Telegram:", e)
 
+    def enviar_foto(self, chat_id: int, image_path: str, caption: str | None = None):
+        """
+        Envía una foto al chat, con un texto opcional (caption).
+        """
+        if not self.bot_token:
+            print("TelegramNotificationChannel: bot_token vacío, no se envía foto.")
+            return
+
+        if not image_path or not os.path.exists(image_path):
+            print("TelegramNotificationChannel: image_path inválido:", image_path)
+            return
+
+        try:
+            with open(image_path, "rb") as f:
+                files = {"photo": f}
+                data = {"chat_id": chat_id}
+                if caption:
+                    data["caption"] = caption
+
+                requests.post(
+                    self.api_url + "/sendPhoto",
+                    data=data,
+                    files=files,
+                    timeout=10,
+                )
+        except Exception as e:
+            print("Error enviando foto a Telegram:", e)
+
     def enviar_evento(
         self,
         chat_id: int,
@@ -37,10 +62,11 @@ class TelegramNotificationChannel:
         severidad: str,
         titulo: str,
         cuerpo: str,
+        image_path: str | None = None,
     ):
         """
         Envía un mensaje formateado a partir de un evento.
-        severidad: 'low', 'medium', 'high', 'critical'
+        Si se pasa image_path, intenta enviar foto + caption.
         """
         s = (severidad or "").lower()
         icono = "ℹ️"
@@ -58,4 +84,8 @@ class TelegramNotificationChannel:
             f"{ahora}"
         )
 
-        self.enviar_texto(chat_id, mensaje)
+        # Si hay imagen válida, la mandamos como foto con caption
+        if image_path and os.path.exists(image_path):
+            self.enviar_foto(chat_id, image_path, caption=mensaje)
+        else:
+            self.enviar_texto(chat_id, mensaje)

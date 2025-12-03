@@ -1487,49 +1487,46 @@ class CameraTab(ttk.Frame):
                     # 2) Mostrar en la interfaz
                     self.banner.show(msg, "info")
 
-                    # 3) Enviar también a Telegram (si está configurado)
-                    try:
-                        cfg = cargar_config_dict()
-                        if not cfg.get("telegram_habilitado"):
-                            # El usuario no ha activado Telegram
-                            continue
+                    msg = f"Movimiento detectado en cámara. Foto: {filename}"
 
-                        bot_token = cfg.get("bot_token")
-                        chat_id = cfg.get("telegram_chat_id")
-                        if not bot_token or not chat_id:
-                            # Falta token o chat vinculado
-                            continue
+                    # 1) Registrar en bitácora
+                    self.repo.add_event(
+                        self.user.id,
+                        did,
+                        type_="camera_motion",
+                        severity="high",
+                        message=msg,
+                        image_path=full_path,
+                        extra={"source": "pc_camera"}
+                    )
 
-                        dispositivo = "Cámara con foto por movimiento"
+                    # 2) Mostrar en la interfaz
+                    self.banner.show(msg, "info")
 
-                        # Ver preferencias por dispositivo
-                        disp_cfg = cfg.get("dispositivos", {}).get(dispositivo, {})
-                        if not disp_cfg.get("enviar_telegram", False):
-                            # Este dispositivo está desactivado para Telegram
-                            continue
+                    # 3) Enviar también a Telegram (si está configurado) con FOTO
+                    enviar_telegram_si_corresponde(
+                        dispositivo="Cámara con foto por movimiento",
+                        severidad="high",
+                        titulo="Movimiento en cámara",
+                        cuerpo=msg,
+                        image_path=full_path   # 👈 AQUÍ mandamos la ruta de la imagen
+                    )
 
-                        # Filtro por severidad mínima (INFO / ALTA / CRITICA)
-                        severidad_actual = "high"       # la que usamos en add_event
-                        mapa_valor = {"low": 1, "medium": 2, "high": 3, "critical": 4}
-                        mapa_min = {"INFO": 1, "ALTA": 3, "CRITICA": 4}
-                        sev_min = disp_cfg.get("severidad_minima", "ALTA").upper()
+                    # Notificación en la app
+                    self.repo.add_notification(
+                        self.user.id,
+                        channel="inapp",
+                        priority="alta",
+                        title="Movimiento en cámara",
+                        body=msg,
+                        status="sent"
+                    )
 
-                        # Si el evento es crítico y está activado "siempre_enviar_criticos", pasa directo
-                        if not (severidad_actual == "critical" and cfg.get("siempre_enviar_criticos", True)):
-                            if mapa_valor.get(severidad_actual, 1) < mapa_min.get(sev_min, 1):
-                                # severidad demasiado baja para enviarse
-                                continue
+                    # Mostrar algo en la pestaña
+                    self._set_status(f"Última captura: {filename}")
 
-                        canal = TelegramNotificationChannel(bot_token)
-                        canal.enviar_evento(
-                            chat_id=chat_id,
-                            dispositivo=dispositivo,
-                            severidad=severidad_actual,
-                            titulo="Movimiento en cámara",
-                            cuerpo=msg
-                        )
-                    except Exception as e:
-                        print("Error al enviar a Telegram desde CameraTab:", e)
+                    last_capture_time = now
+
 
 
                     # Notificación en la app
@@ -1859,6 +1856,7 @@ class QuickActions(ttk.Frame):
             severidad="high",
             titulo="Movimiento detectado",
             cuerpo="Se detectó movimiento en el área protegida."
+            
         )
         play_beep(1200, 250)
 
