@@ -417,6 +417,42 @@ class DevicesTab(ttk.Frame):
         if not did: return
         ScheduleDialog(self, self.repo, device_id=did, on_saved=lambda: self.banner.show("Horarios actualizados", 'success'))
 
+class SmokeSensorTab(ttk.Frame):
+    def __init__(self, master, repo, user, banner):
+        super().__init__(master)
+
+        self.repo = repo
+        self.user = user
+        self.banner = banner
+
+        ttk.Label(self, text="Eventos del sensor de humo", font=("Segoe UI", 14)).pack(pady=10)
+
+        self.listbox = tk.Listbox(self, font=("Segoe UI", 11))
+        self.listbox.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.update_events()
+
+    def update_events(self):
+        self.listbox.delete(0, "end")
+
+        # 👇 OJO: el tipo debe coincidir con event_type="smoke_start" del JSON
+        rows, total = self.repo.list_events(
+            self.user.id,
+            typ="smoke_start",
+            severity="",   # o "critical" si quieres solo críticos
+            page=1,
+            page_size=50
+        )
+
+        for r in rows:
+            self.listbox.insert("end", f"{r['ts']} — {r['message']}")
+
+        self.after(2000, self.update_events)
+
+    def refresh_state(self):
+        pass
+
+
 class MotionSensorTab(ttk.Frame):
     def __init__(self, master, repo, user, banner):
         super().__init__(master)
@@ -2148,7 +2184,7 @@ class MainView(ttk.Frame):
         self.tab_hist    = HistogramTab(nb, self.repo, self.user, self.banner)
         self.tab_lock    = LockTab(nb, self.repo, self.user, self.banner, pico=self.pico)
         self.tab_motion = MotionSensorTab(nb, self.repo, self.user, self.banner)
-        self.tab_smoke   = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Sensor de humo", title="Panel específico — Sensor de humo")
+        self.tab_smoke  = SmokeSensorTab(nb, self.repo, self.user, self.banner)
         self.tab_camera  = CameraTab(nb, self.repo, self.user, self.banner)
         self.tab_presence = PresenceSimTab(nb, self.repo, self.user, self.banner, pico=self.pico)
         self.tab_panic   = DeviceTypeTab(
