@@ -564,39 +564,118 @@ class EventsTab(ttk.Frame):
 
 class HistogramTab(ttk.Frame):
     def __init__(self, master, repo: Repo, user: User, banner: Banner):
-        super().__init__(master); self.repo=repo; self.user=user; self.banner=banner
-        ctr = ttk.Frame(self); ctr.pack(fill='x', padx=8, pady=6)
-        ttk.Label(ctr, text="Dispositivo (opcional ID)").pack(side='left'); self.e_dev = ttk.Entry(ctr, width=8); self.e_dev.pack(side='left', padx=4)
-        ttk.Label(ctr, text="Desde (YYYY-MM-DD)").pack(side='left', padx=(10,4)); self.e_from = ttk.Entry(ctr, width=12); self.e_from.pack(side='left')
-        ttk.Label(ctr, text="Hasta (YYYY-MM-DD)").pack(side='left', padx=(10,4)); self.e_to = ttk.Entry(ctr, width=12); self.e_to.pack(side='left')
+        super().__init__(master)
+        self.repo = repo
+        self.user = user
+        self.banner = banner
+
+        ctr = ttk.Frame(self)
+        ctr.pack(fill='x', padx=8, pady=6)
+
+        ttk.Label(ctr, text="Dispositivo (opcional ID)").pack(side='left')
+        self.e_dev = ttk.Entry(ctr, width=8)
+        self.e_dev.pack(side='left', padx=4)
+
+        ttk.Label(ctr, text="Desde (YYYY-MM-DD)").pack(side='left', padx=(10, 4))
+        self.e_from = ttk.Entry(ctr, width=12)
+        self.e_from.pack(side='left')
+
+        ttk.Label(ctr, text="Hasta (YYYY-MM-DD)").pack(side='left', padx=(10, 4))
+        self.e_to = ttk.Entry(ctr, width=12)
+        self.e_to.pack(side='left')
+
         ttk.Button(ctr, text="Generar", command=self._plot).pack(side='left', padx=6)
+
         self.canvas = None
-        if not HAS_MPL: ttk.Label(self, text="Instala matplotlib para ver el histograma.").pack(pady=12)
+
+        if not HAS_MPL:
+            ttk.Label(self, text="Instala matplotlib para ver el histograma.").pack(pady=12)
+
     def _plot(self):
+        # 1) Asegurarnos de que matplotlib esté disponible
+        global HAS_MPL
         if not HAS_MPL:
             try:
                 from matplotlib.figure import Figure
                 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+                HAS_MPL = True
             except Exception as e:
-                self.banner.show(f"matplotlib no disponible: {e.__class__.__name__}", 'warning'); return
+                self.banner.show(f"matplotlib no disponible: {e.__class__.__name__}", 'warning')
+                return
+        else:
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+        # 2) Leer filtros
         device_id = int(self.e_dev.get()) if self.e_dev.get().strip().isdigit() else None
-        date_from = self.e_from.get().strip() or None; date_to = self.e_to.get().strip() or None
-        rows, _ = self.repo.list_events(self.user.id, page=1, page_size=10000, device_id=device_id, date_from=date_from, date_to=date_to)
-        counts = {}; days = []
-        if date_from and date_to:
+        date_from = self.e_from.get().strip() or None
+        date_to   = self.e_to.get().strip() or None
+
+        # Si el usuario pone solo fecha final, la hacemos inclusiva sumando 1 día
+        if date_to:
             try:
-                d0 = datetime.fromisoformat(date_from); d1 = datetime.fromisoformat(date_to); cur = d0
-                while cur <= d1:
-                    key = cur.strftime('%Y-%m-%d'); counts[key] = 0; days.append(key); cur += timedelta(days=1)
-            except Exception: pass
+                d_to = datetime.fromisoformat(date_to).date()
+                date_to = (d_to + timedelta(days=1)).isoformat()
+            except Exception:
+                self.banner.show("Formato de fecha 'Hasta' inválido (usa YYYY-MM-DD)", 'warning')
+                return
+
+        if date_from:
+            try:
+                _ = datetime.fromisoformat(date_from).date()
+            except Exception:
+                self.banner.show("Formato de fecha 'Desde' inválido (usa YYYY-MM-DD)", 'warning')
+                return
+
+        # 3) Traer eventos
+        rows, _ = self.repo.list_events(
+            self.user.id,
+            page=1,
+            page_size=10000,
+            device_id=device_id,
+            date_from=date_from,
+            date_to=date_to
+        )
+
+        if not rows:
+            self.banner.show("No hay eventos en el rango seleccionado.", 'info')
+            if self.canvas:
+                self.canvas.get_tk_widget().destroy()
+                self.canvas = None
+            return
+
+        # 4) Contar eventos por día
+        counts = {}
+        days = []
+
         for r in rows:
-            key = r['ts'][:10]; counts[key] = counts.get(key, 0) + 1
-            if key not in days: days.append(key)
-        days.sort(); vals = [counts.get(d,0) for d in days]
-        fig = Figure(figsize=(7,3), dpi=100); ax = fig.add_subplot(111)
-        ax.bar(days, vals); ax.set_title('Eventos por día'); ax.set_ylabel('# eventos'); ax.set_xticklabels(days, rotation=30, ha='right')
-        if self.canvas: self.canvas.get_tk_widget().destroy()
-        self.canvas = FigureCanvasTkAgg(fig, master=self); self.canvas.draw(); self.canvas.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=8)
+            key = r['ts'][:10]  # yyyy-mm-dd
+            counts[key] = counts.get(key, 0) + 1
+            if key not in days:
+                days.append(key)
+
+        days.sort()
+        vals = [counts.get(d, 0) for d in days]
+
+        # 5) Crear figura
+        fig = Figure(figsize=(7, 3), dpi=100)
+        ax = fig.add_subplot(111)
+
+        # Usamos índices como posiciones de barras
+        x = list(range(len(days)))
+        ax.bar(x, vals)
+        ax.set_title('Eventos por día')
+        ax.set_ylabel('# eventos')
+        ax.set_xticks(x)
+        ax.set_xticklabels(days, rotation=30, ha='right')
+
+        # 6) Insertar en Tkinter
+        if self.canvas:
+            self.canvas.get_tk_widget().destroy()
+
+        self.canvas = FigureCanvasTkAgg(fig, master=self)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill='both', expand=True, padx=8, pady=8)
 
 class WiFiPicoBridge:
     def __init__(self, host="0.0.0.0", port=12345, repo: Optional[Repo] = None):
