@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import random
 import string
 
-CONFIG_PATH = Path("notificaciones_config.json")
+CONFIG_PATH = Path(__file__).parent / "notificaciones_config.json"
 
 def cargar_config_dict():
     if not CONFIG_PATH.exists():

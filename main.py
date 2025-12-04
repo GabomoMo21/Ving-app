@@ -417,42 +417,6 @@ class DevicesTab(ttk.Frame):
         if not did: return
         ScheduleDialog(self, self.repo, device_id=did, on_saved=lambda: self.banner.show("Horarios actualizados", 'success'))
 
-class SmokeSensorTab(ttk.Frame):
-    def __init__(self, master, repo, user, banner):
-        super().__init__(master)
-
-        self.repo = repo
-        self.user = user
-        self.banner = banner
-
-        ttk.Label(self, text="Eventos del sensor de humo", font=("Segoe UI", 14)).pack(pady=10)
-
-        self.listbox = tk.Listbox(self, font=("Segoe UI", 11))
-        self.listbox.pack(fill="both", expand=True, padx=10, pady=10)
-
-        self.update_events()
-
-    def update_events(self):
-        self.listbox.delete(0, "end")
-
-        # 👇 OJO: el tipo debe coincidir con event_type="smoke_start" del JSON
-        rows, total = self.repo.list_events(
-            self.user.id,
-            typ="smoke_start",
-            severity="",   # o "critical" si quieres solo críticos
-            page=1,
-            page_size=50
-        )
-
-        for r in rows:
-            self.listbox.insert("end", f"{r['ts']} — {r['message']}")
-
-        self.after(2000, self.update_events)
-
-    def refresh_state(self):
-        pass
-
-
 class MotionSensorTab(ttk.Frame):
     def __init__(self, master, repo, user, banner):
         super().__init__(master)
@@ -723,6 +687,10 @@ class WiFiPicoBridge:
         self._pico = None
         self._lock = threading.Lock()
         self._start_server()
+        # Antirrebote para Puertas/ventanas: device_id -> (ultimo_estado, ultimo_timestamp)
+        self._doorwin_last = {}
+
+        self._start_server()
 
     def _start_server(self):
         def loop():
@@ -817,11 +785,6 @@ class WiFiPicoBridge:
                 pass
 
     def _try_handle_json_event(self, line: str) -> bool:
-        """
-        Intenta interpretar la línea como un JSON de evento de dispositivo.
-        Devuelve True si se procesó como evento (aunque el dispositivo no exista),
-        False si no era un JSON de evento y hay que tratarlo como comando normal.
-        """
         if not self.repo:
             return False
 
@@ -850,23 +813,24 @@ class WiFiPicoBridge:
             print(f"[WiFiPicoBridge] Evento para serie desconocida: {serial}")
             return True  # lo consideramos manejado para no enviar error al cliente
 
-        
-        if not bool(row["armed"]):
-            print(f"[WiFiPicoBridge] Evento ignorado (dispositivo DESARMADO): {serial}")
-            return True  # No guardamos nada en la bitácora
-
+        dev_type = row["type"]          # ej: "Barrera láser", "Puertas/ventanas"
+        is_armed = bool(row["armed"])
         user_id = row["user_id"]
         device_id = row["id"]
 
+        # ---------- Regla general: solo procesamos si el dispositivo está ARMADO ----------
+        if not is_armed:
+            print(f"[WiFiPicoBridge] Evento ignorado (dispositivo DESARMADO): {serial} ({dev_type})")
+            return True
+
         # Campos de evento
         event_type = obj.get("event_type") or obj.get("type") or "generic"
-        severity = obj.get("severity") or "low"
-        message = (
+        severity   = (obj.get("severity") or "low").lower()
+        message    = (
             obj.get("message")
             or obj.get("msg")
             or f"Evento {event_type} desde dispositivo {serial}"
         )
-
 
         extra = obj.get("extra") or {}
         if not isinstance(extra, dict):
@@ -874,7 +838,35 @@ class WiFiPicoBridge:
         # Marcamos fuente como hardware / WiFi
         extra.setdefault("source", "wifi")
 
-        # Guardar en la bitácora (tabla events)
+        # ---------- (Opcional) lógica especial para Puertas/ventanas ----------
+        door_state = None
+        simple_state = None  # "open" / "closed"
+        if dev_type == DEVICE_DOORWIN:
+            door_state = (
+                obj.get("door_state")
+                or extra.get("door_state")
+                or obj.get("estado")
+            )
+            if door_state is not None:
+                door_state = str(door_state).lower()
+
+            if door_state is None:
+                msg_low = message.lower()
+                if "abier" in msg_low or "open" in msg_low:
+                    door_state = "open"
+                elif "cerr" in msg_low or "closed" in msg_low:
+                    door_state = "closed"
+
+            if door_state:
+                if "open" in door_state or "abier" in door_state:
+                    simple_state = "open"
+                elif "closed" in door_state or "cerr" in door_state:
+                    simple_state = "closed"
+
+            # Antirrebote si quieres mantenerlo:
+            # (si no lo estás usando aún, puedes quitar este bloque sin problema)
+
+        # ---------- Guardar en la bitácora ----------
         self.repo.add_event(
             user_id=user_id,
             device_id=device_id,
@@ -885,8 +877,53 @@ class WiFiPicoBridge:
             extra=extra,
         )
 
-        print(f"[WiFiPicoBridge] Evento registrado: {event_type} ({severity}) serial={serial}")
+        print(f"[WiFiPicoBridge] Evento registrado: dev_type={dev_type}, event_type={event_type}, sev={severity}, serial={serial}")
+
+        # ---------- Efectos especiales según tipo de dispositivo ----------
+
+        # Puertas/ventanas: beep + Telegram
+        if dev_type == DEVICE_DOORWIN:
+            is_open = False
+            if simple_state:
+                is_open = (simple_state == "open")
+            elif door_state:
+                is_open = ("open" in door_state or "abier" in door_state)
+
+            if is_open:
+                try:
+                    play_beep(1200, 250)
+                except Exception as e:
+                    print("[WiFiPicoBridge] Error en beep Puertas/ventanas:", e)
+
+            if severity in ("high", "critical"):
+                try:
+                    enviar_telegram_si_corresponde(
+                        dispositivo=DEVICE_DOORWIN,
+                        severidad=severity,
+                        titulo="Puerta/Ventana",
+                        cuerpo=message,
+                    )
+                except Exception as e:
+                    print("[WiFiPicoBridge] Error enviando Telegram Puertas/ventanas:", e)
+
+        # Barrera láser: Telegram cuando la severidad sea alta
+        if dev_type == DEVICE_LASER and severity in ("high", "critical"):
+            try:
+                enviar_telegram_si_corresponde(
+                    dispositivo=DEVICE_LASER,   # "Barrera láser"
+                    severidad=severity,
+                    titulo="Barrera láser",
+                    cuerpo=message,
+                )
+            except Exception as e:
+                print("[WiFiPicoBridge] Error enviando Telegram Barrera láser:", e)
+
         return True
+
+
+
+
+
 
     def _readline(self, s, timeout_ms=1500):
         """Lectura bloqueante de una línea de la Pico (para respuestas a comandos)."""
@@ -1411,6 +1448,58 @@ class DeviceTypeTab(ttk.Frame):
             if r: did = r['id']
         self.repo.add_event(self.user.id, did, 'generic', 'low', f"Evento simulado para tipo {self.device_type}", None, {})
         self.banner.show(f"Evento simulado ({self.device_type})", 'info'); play_beep(900, 120)
+class LaserTab(DeviceTypeTab):
+    """
+    Pestaña específica para 'Barrera láser', con botón directo de horarios.
+    """
+    def __init__(self, master, repo: Repo, user: User, banner: Banner):
+        super().__init__(
+            master,
+            repo=repo,
+            user=user,
+            banner=banner,
+            device_type=DEVICE_LASER,
+            title="Panel específico — Barrera láser"
+        )
+
+        # Frame extra para el botón de horarios
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill='x')
+
+        ttk.Button(
+            frm,
+            text="Configurar horario de armado automático",
+            command=self._open_laser_schedule
+        ).pack(side='left')
+
+    def _get_first_laser_id(self) -> Optional[int]:
+        with sqlite3.connect(self.repo.path) as cx:
+            cx.row_factory = sqlite3.Row
+            r = cx.execute(
+                "SELECT id FROM devices WHERE user_id=? AND type=? ORDER BY id LIMIT 1",
+                (self.user.id, DEVICE_LASER)
+            ).fetchone()
+            return r["id"] if r else None
+
+    def _open_laser_schedule(self):
+        did = self._get_first_laser_id()
+        if not did:
+            messagebox.showwarning(
+                "Barrera láser",
+                "Primero registra un dispositivo de tipo 'Barrera láser' en la pestaña Dispositivos."
+            )
+            return
+
+        ScheduleDialog(
+            self,
+            self.repo,
+            device_id=did,
+            on_saved=lambda: self.banner.show(
+                "Horario de barrera láser actualizado",
+                "success"
+            )
+        )
+
 
 class CameraTab(ttk.Frame):
     """
@@ -1885,6 +1974,9 @@ DEVICE_DOORWIN = "Puertas/ventanas"
 DEVICE_SILENT_ALARM = "Alarma silenciosa"
 DEVICE_LASER = "Barrera láser"
 DEVICE_LPR = "Reconocimiento de placas"
+# Tiempo mínimo entre eventos repetidos del mismo estado (en segundos)
+DOORWIN_DEBOUNCE_SECONDS = 3.0
+
 
 
 class QuickActions(ttk.Frame):
@@ -2062,10 +2154,24 @@ class QuickActions(ttk.Frame):
 
     def door_window_toggle(self):
         did = self._pick_device(DEVICE_DOORWIN)
-        row = self.repo.get_device(did) if did else None
-        new_state = "open" if (row and row["status"] != "open") else "closed"
-        if did:
-            self.repo.set_device_status(did, new_state)
+        if not did:
+            self._notify("Puerta/Ventana", "No hay dispositivo Puertas/ventanas configurado.")
+            return
+
+        row = self.repo.get_device(did)
+        # Si por alguna razón no se pudo leer, salimos
+        if not row:
+            self._notify("Puerta/Ventana", "Dispositivo no encontrado en la BD.")
+            return
+
+        is_armed = bool(row["armed"])
+        # Solo queremos bitácora / alerta cuando está armado
+        if not is_armed:
+            self._notify("Puerta/Ventana", "Evento ignorado (dispositivo desarmado).")
+            return
+
+        new_state = "open" if row["status"] != "open" else "closed"
+        self.repo.set_device_status(did, new_state)
 
         self.repo.add_event(
             self.user.id,
@@ -2076,13 +2182,22 @@ class QuickActions(ttk.Frame):
             None,
             {},
         )
+
+        # Notificación interna en la app
         self._notify("Puerta/Ventana", f"{new_state}")
+
+        # Sonido cuando se abre y está armado
+        if new_state == "open":
+            play_beep(1200, 250)
+
+        # Notificación a Telegram
         enviar_telegram_si_corresponde(
             dispositivo=DEVICE_DOORWIN,
             severidad="high",
             titulo="Puerta/Ventana",
             cuerpo=f"Estado: {new_state}"
         )
+
 
     def silent_alarm(self):
         did = self._pick_device("Alarma silenciosa")
@@ -2184,7 +2299,7 @@ class MainView(ttk.Frame):
         self.tab_hist    = HistogramTab(nb, self.repo, self.user, self.banner)
         self.tab_lock    = LockTab(nb, self.repo, self.user, self.banner, pico=self.pico)
         self.tab_motion = MotionSensorTab(nb, self.repo, self.user, self.banner)
-        self.tab_smoke  = SmokeSensorTab(nb, self.repo, self.user, self.banner)
+        self.tab_smoke   = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Sensor de humo", title="Panel específico — Sensor de humo")
         self.tab_camera  = CameraTab(nb, self.repo, self.user, self.banner)
         self.tab_presence = PresenceSimTab(nb, self.repo, self.user, self.banner, pico=self.pico)
         self.tab_panic   = DeviceTypeTab(
@@ -2280,9 +2395,17 @@ class MainView(ttk.Frame):
         self.tab_panic.btn_action.configure(style="Panic.TButton")
         self.tab_doorwin = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Puertas/ventanas", title="Panel específico — Puertas/ventanas")
         self.tab_silent  = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Alarma silenciosa", title="Panel específico — Alarma silenciosa")
-        self.tab_laser   = DeviceTypeTab(nb, self.repo, self.user, self.banner, device_type="Barrera láser", title="Panel específico — Barrera láser")
+        self.tab_laser   = LaserTab(nb, self.repo, self.user, self.banner)
         self.tab_lpr     = LprTab(nb, self.repo, self.user, self.banner)
         self.tab_quick   = QuickActions(nb, self.repo, self.user, self.banner)
+                # ---- Personalizar pestaña Puertas/ventanas ----
+        # Hacemos que el botón principal de ese tab use la misma lógica
+        # que el simulador de QuickActions (abre/cierra y manda Telegram).
+        self.tab_doorwin.btn_action.configure(
+            text="Simular apertura/cierre",
+            command=self.tab_quick.door_window_toggle
+        )
+
         nb.add(self.tab_devices, text='Dispositivos'); nb.add(self.tab_events,  text='Bitácora'); nb.add(self.tab_hist,    text='Histograma'); nb.add(self.tab_lock,    text='Cerraduras')
         nb.add(self.tab_motion,  text='Movimiento');  nb.add(self.tab_smoke,   text='Humo');     nb.add(self.tab_camera,  text='Cámara');     nb.add(self.tab_presence,text='Presencia')
         nb.add(self.tab_panic,   text='Silenciosa');      nb.add(self.tab_doorwin, text='Puertas/Vent.'); nb.add(self.tab_silent,  text='Silenciosa'); nb.add(self.tab_laser,   text='Láser')
@@ -2290,7 +2413,13 @@ class MainView(ttk.Frame):
         hdr = ttk.Frame(self, padding=6); hdr.pack(fill='x', side='top')
         ttk.Label(hdr, text=f"Bienvenido, {user.name}", font=("Segoe UI", 12, 'bold')).pack(side='left')
         ttk.Button(hdr, text="Cerrar sesión", command=self._logout).pack(side='right')
-        self.pack(fill='both', expand=True); self._refresh_type_tabs()
+
+        self.pack(fill='both', expand=True)
+        self._refresh_type_tabs()
+
+        # >>> Iniciar lazo de armado automático <<<
+        self._auto_arm_loop()
+
     def _logout(self):
         if messagebox.askyesno("Salir", "¿Cerrar sesión?"): self.master.destroy(); main()
     def _on_event(self, kind=None, *args, **kwargs):
@@ -2300,6 +2429,103 @@ class MainView(ttk.Frame):
         self.tab_lock.refresh_state()
         for tab in (self.tab_motion,self.tab_smoke,self.tab_camera,self.tab_presence,self.tab_panic,self.tab_doorwin,self.tab_silent,self.tab_laser,self.tab_lpr):
             tab.refresh_state()
+        # ------------------------------------------
+    # Armado automático según schedules_json
+    # ------------------------------------------
+    @staticmethod
+    def _should_be_armed_now(schedules_json: str) -> bool:
+        """
+        Devuelve True si, según los tramos de horario guardados en schedules_json,
+        el dispositivo debería estar ARMADO en este momento.
+        Formato esperado: [{"start": "HH:MM", "end": "HH:MM"}, ...]
+        """
+        if not schedules_json:
+            return False
+
+        try:
+            items = json.loads(schedules_json)
+        except Exception:
+            return False
+
+        if not isinstance(items, list):
+            return False
+
+        now = datetime.now()
+        now_min = now.hour * 60 + now.minute
+
+        for it in items:
+            try:
+                s = it.get("start")
+                e = it.get("end")
+                h1, m1 = map(int, s.split(":"))
+                h2, m2 = map(int, e.split(":"))
+            except Exception:
+                continue
+
+            start_min = h1 * 60 + m1
+            end_min   = h2 * 60 + m2
+
+            # Intervalo [start_min, end_min)
+            if start_min <= now_min < end_min:
+                return True
+
+        return False
+
+    def _apply_auto_arm(self):
+        """
+        Revisa todos los dispositivos del usuario actual y ajusta el campo 'armed'
+        según los horarios configurados (schedules_json).
+        Registra en la bitácora los cambios AUTOMÁTICOS de armado/desarmado.
+        """
+        with sqlite3.connect(self.repo.path) as cx:
+            cx.row_factory = sqlite3.Row
+            rows = cx.execute(
+                "SELECT id, alias, type, armed, schedules_json "
+                "FROM devices WHERE user_id=?",
+                (self.user.id,)
+            ).fetchall()
+
+        changed = False
+
+        for row in rows:
+            schedules_json = row["schedules_json"] or ""
+            should_arm = self._should_be_armed_now(schedules_json)
+            is_armed   = bool(row["armed"])
+
+            if should_arm != is_armed:
+                # Cambiar estado
+                self.repo.set_device_armed(row["id"], should_arm)
+                state = "Armado" if should_arm else "Desarmado"
+                msg = f"Sistema {state.lower()} automáticamente por horario"
+
+                self.repo.add_event(
+                    self.user.id,
+                    row["id"],
+                    type_="arm_state",
+                    severity="low",
+                    message=msg,
+                    image_path=None,
+                    extra={"auto": True}
+                )
+                print(f"[AUTO-ARM] {row['alias']} ({row['type']}): {state}")
+                changed = True
+
+        if changed:
+            # Refrescar pestañas que dependen de 'armed'
+            self._on_event("devices_changed")
+
+    def _auto_arm_loop(self):
+        """
+        Lazo recurrente: aplica el armado automático y se reprograma cada minuto.
+        """
+        try:
+            self._apply_auto_arm()
+        except Exception as e:
+            print("[AUTO-ARM] Error:", e)
+
+        # Ejecutar de nuevo en 60 segundos
+        self.after(60_000, self._auto_arm_loop)
+
     def generar_codigo_enlace(self):
         try:
             codigo, expira = preparar_codigo_enlace()
